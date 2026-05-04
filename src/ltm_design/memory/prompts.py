@@ -36,6 +36,8 @@ A good memory captures one durable, future-useful hotspot:
 - a commitment
 - a relationship or recurring pattern
 - an emotional or multimodal observation, if useful and grounded
+- a user preference or expectation for model behavior, including indirect signals such as frustration with how the model acted
+- a user expectation about what the model should already know, verify, cite, or avoid hallucinating about
 
 Do not create memories for:
 - generic internet-searchable facts
@@ -45,6 +47,8 @@ Do not create memories for:
 - weak guesses about emotion or intent
 
 Use direct wording when the user stated something. Use cautious wording for observations. Attach relevant facets for labeling. Leave irrelevant facet lists blank. Attach references pointing to source records.
+
+For model-behavior expectations, do not store the generic factual details themselves when they are searchable. Store the user's expectation. For example: store that the user expects the model to know DeepSeek v4 exists, or expects the model not to hallucinate about a topic and to cite a specific source.
 
 After this cataloging step, you will receive connection/redundancy information for each memory. You will then help decide which memories should be stored and which connections are worth keeping.
 
@@ -195,14 +199,14 @@ Output JSON:
   "reject_memories": [
     {
       "new_memory_index": 0,
-      "reason": "duplicate|generic|filler|unsupported|too_transient|other"
+      "reason": "same_as|duplicate|generic|filler|unsupported|too_transient|other"
     }
   ],
   "approve_links": [
     {
       "from_new_memory_index": 0,
       "to_mem_id": "string",
-      "relation": "updates|contradicts|supports|elaborates|caused_by|part_of|same_as",
+      "relation": "updates|contradicts|supports|elaborates|caused_by|part_of",
       "reason": "string"
     }
   ]

@@ -69,9 +69,10 @@ Memory writing uses the same discipline as recall: extracted memories and possib
    - proposed links use only `updates`, `contradicts`, `supports`, `elaborates`, `caused_by`, `part_of`, or `same_as`
 7. Surface extracted memories, nearby memory snippets, connection proposals, and evidence refs to the main memory decision model.
 8. The main memory decision model approves/rejects memory writes and approves/rejects links. It may use `load_full_memory(mem_id)` when snippets are insufficient.
-9. Approved memory items are indexed and placed into memory fragments.
+9. Approved memory items are indexed and placed into memory item groups.
+10. When placing an approved memory into a recall group, choose the group with the most direct/nearby connections that still has space. Target max group size is 20K tokens. If all connected groups are full, or the memory has no connections, choose the group with the most empty space. If no group can fit the memory, create a new group.
 
-The active memorization skill and idle auto-memorization path share this pipeline. Active memorization starts the branch when the live conversation wants memory processing now. Idle auto-memorization starts the same branch after a quiet period and supplies the next unprocessed evidence range.
+The active memorization skill and idle auto-memorization path share this pipeline. Active memorization starts when the live conversation wants memory processing now. Idle auto-memorization starts the same processing after a quiet period and supplies the next unprocessed evidence range.
 
 ### Live Conversation Trigger Policy
 
@@ -198,12 +199,14 @@ The warm prompt must not create user-visible memory output. It should use the sa
 
 DeepSeek's official API docs currently document chat/completion models and OpenAI-compatible chat usage, but do not clearly document a first-party embeddings model. Treat embeddings as a swappable local/provider component rather than binding them to DeepSeek.
 
-Recommended v0:
+Embedding implementation:
 
 - local/open embeddings with `sentence-transformers`
 - default model: `Qwen/Qwen3-Embedding-8B`
-- use Qwen's `query` prompt for query embeddings
-- store vectors in SQLite with `sqlite-vec`, DuckDB, LanceDB, or simple NumPy files while the prototype is small
+- use Qwen's `query:` prefix for query embeddings
+- store vectors in SQLite `memory_embeddings` rows keyed by `(mem_id, model)`
+- search vectors with cosine similarity over normalized vectors
+- combine vector candidates with SQLite FTS5 and exact facet matching by `mem_id`
 
 Why Qwen first:
 

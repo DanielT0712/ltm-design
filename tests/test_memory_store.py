@@ -20,6 +20,9 @@ from ltm_design.memory.models import (
 )
 from ltm_design.memory.source_location import locate_source_span, resolve_source_anchors
 from ltm_design.memory.store import MemoryStore
+from ltm_design.memory.search import MemoryIndexer, MemorySearch
+from ltm_design.memory.tools import MemoryTools
+from conftest import FakeEmbeddingProvider
 
 
 def test_active_memorization_persists_text_facets_and_evidence(tmp_path):
@@ -148,6 +151,53 @@ def test_memory_fragment_blocks_multiple_memory_items(tmp_path):
     assert second.mem_id in fragment.text
 
 
+def test_assign_to_recall_fragment_prefers_connected_fragment_with_space(tmp_path):
+    store = MemoryStore(tmp_path / "memory.db")
+    connected = store.remember(MemoryCandidate(text="Connected memory."))
+    unrelated = store.remember(MemoryCandidate(text="Unrelated memory."))
+    new = store.remember(MemoryCandidate(text="New memory."))
+    store.add_links(new.mem_id, (MemoryLink(to_mem_id=connected.mem_id, relation=MemoryRelation.ELABORATES),))
+    connected_fragment = store.build_fragment(
+        kind=FragmentKind.RECALL,
+        mem_ids=(connected.mem_id,),
+        title="connected",
+    )
+    store.build_fragment(
+        kind=FragmentKind.RECALL,
+        mem_ids=(unrelated.mem_id,),
+        title="unrelated",
+    )
+
+    assigned = store.assign_to_recall_fragment(new.mem_id)
+
+    assert assigned.fragment_id != connected_fragment.fragment_id
+    assert assigned.title == "connected"
+    assert assigned.mem_ids == (connected.mem_id, new.mem_id)
+
+
+def test_assign_to_recall_fragment_uses_most_empty_when_no_connections(tmp_path):
+    store = MemoryStore(tmp_path / "memory.db")
+    fuller_a = store.remember(MemoryCandidate(text="A " * 10))
+    fuller_b = store.remember(MemoryCandidate(text="B " * 10))
+    emptier = store.remember(MemoryCandidate(text="C"))
+    new = store.remember(MemoryCandidate(text="New memory."))
+    store.build_fragment(
+        kind=FragmentKind.RECALL,
+        mem_ids=(fuller_a.mem_id, fuller_b.mem_id),
+        title="fuller",
+    )
+    store.build_fragment(
+        kind=FragmentKind.RECALL,
+        mem_ids=(emptier.mem_id,),
+        title="emptier",
+    )
+
+    assigned = store.assign_to_recall_fragment(new.mem_id)
+
+    assert assigned.title == "emptier"
+    assert assigned.mem_ids == (emptier.mem_id, new.mem_id)
+
+
 def test_locate_source_span_returns_stable_coordinates():
     record = EvidenceRecord(
         source_id="episode_1",
@@ -200,3 +250,33 @@ def test_resolve_source_anchors_can_reference_whole_source():
     assert span.char_start == 0
     assert span.char_end == len(record.text)
     assert span.matched_text == record.text
+
+
+def test_vector_search_finds_indexed_memory(tmp_path):
+    store = MemoryStore(tmp_path / "memory.db")
+    item = store.remember(
+        MemoryCandidate(
+            text="Daniel wants memory summarizers to cite mem ids only.",
+            facets=Facets(topics=("memory summarizers",)),
+        )
+    )
+    embeddings = FakeEmbeddingProvider()
+    MemoryIndexer(store, embeddings).index_item(item)
+
+    result = MemorySearch(store, embeddings).search(text="summarizers cite mem ids")
+
+    assert result.candidates
+    assert result.candidates[0].mem_id == item.mem_id
+
+
+def test_load_full_memory_loads_two_connection_layers(tmp_path):
+    store = MemoryStore(tmp_path / "memory.db")
+    first = store.remember(MemoryCandidate(text="First memory."))
+    second = store.remember(MemoryCandidate(text="Second memory."))
+    third = store.remember(MemoryCandidate(text="Third memory."))
+    store.add_links(first.mem_id, (MemoryLink(to_mem_id=second.mem_id, relation=MemoryRelation.ELABORATES),))
+    store.add_links(second.mem_id, (MemoryLink(to_mem_id=third.mem_id, relation=MemoryRelation.SUPPORTS),))
+
+    record = MemoryTools(store).load_full_memory(first.mem_id)
+
+    assert [item["mem_id"] for item in record.records] == [first.mem_id, second.mem_id, third.mem_id]

@@ -103,6 +103,16 @@ class MemoryStore:
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS memory_embeddings (
+              mem_id TEXT NOT NULL,
+              model TEXT NOT NULL,
+              dimensions INTEGER NOT NULL,
+              vector_json TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              PRIMARY KEY (mem_id, model),
+              FOREIGN KEY (mem_id) REFERENCES memory_items(mem_id) ON DELETE CASCADE
+            );
             """
         )
         self._conn.commit()
@@ -270,6 +280,36 @@ class MemoryStore:
         ).fetchall()
         return [self._row_to_item(row) for row in rows]
 
+    def store_embedding(
+        self,
+        mem_id: str,
+        *,
+        model: str,
+        dimensions: int,
+        vector: list[float],
+        now: datetime | None = None,
+    ) -> None:
+        if len(vector) != dimensions:
+            raise ValueError("vector length does not match dimensions")
+        if self.get(mem_id) is None:
+            raise KeyError(mem_id)
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT OR REPLACE INTO memory_embeddings (
+                  mem_id, model, dimensions, vector_json, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (mem_id, model, dimensions, json.dumps(vector), datetime_to_str(now or utc_now())),
+            )
+
+    def list_embeddings(self, *, model: str) -> list[tuple[str, list[float]]]:
+        rows = self._conn.execute(
+            "SELECT mem_id, vector_json FROM memory_embeddings WHERE model = ? ORDER BY mem_id",
+            (model,),
+        ).fetchall()
+        return [(row["mem_id"], json.loads(row["vector_json"])) for row in rows]
+
     def match_facets(self, facets: Facets, *, limit: int = 50) -> list[MemoryItem]:
         wanted = {
             key: {self._norm(value) for value in values}
@@ -411,6 +451,57 @@ class MemoryStore:
             )
         return fragment
 
+    def assign_to_recall_fragment(
+        self,
+        mem_id: str,
+        *,
+        max_tokens: int = 20_000,
+        now: datetime | None = None,
+    ) -> MemoryFragment:
+        item = self.get(mem_id)
+        if item is None:
+            raise KeyError(mem_id)
+
+        fragments = self._list_fragments(kind=FragmentKind.RECALL)
+        connected_ids = set(self.connected_mem_ids(mem_id, relation_depth=2))
+        item_tokens = self._item_token_estimate(item)
+        fitting_fragments = [
+            fragment for fragment in fragments
+            if fragment.token_count_estimate + item_tokens <= max_tokens
+        ]
+
+        chosen: MemoryFragment | None = None
+        if connected_ids and fitting_fragments:
+            connected_ranked = sorted(
+                fitting_fragments,
+                key=lambda fragment: (
+                    len(set(fragment.mem_ids).intersection(connected_ids)),
+                    max_tokens - fragment.token_count_estimate,
+                ),
+                reverse=True,
+            )
+            if connected_ranked and set(connected_ranked[0].mem_ids).intersection(connected_ids):
+                chosen = connected_ranked[0]
+
+        if chosen is None and fitting_fragments:
+            chosen = max(fitting_fragments, key=lambda fragment: max_tokens - fragment.token_count_estimate)
+
+        if chosen is None:
+            return self.build_fragment(
+                kind=FragmentKind.RECALL,
+                mem_ids=(mem_id,),
+                title=item.title or self._title_for(item.text),
+                now=now,
+            )
+
+        next_mem_ids = tuple(dict.fromkeys((*chosen.mem_ids, mem_id)))
+        return self.build_fragment(
+            kind=FragmentKind.RECALL,
+            mem_ids=next_mem_ids,
+            title=chosen.title,
+            now=now,
+        )
+
     def _upsert_fts(self, mem_id: str, title: str, lexical_text: str, facets: Facets) -> None:
         self._conn.execute("DELETE FROM memory_items_fts WHERE mem_id = ?", (mem_id,))
         self._conn.execute(
@@ -470,6 +561,33 @@ class MemoryStore:
 
     def _norm(self, value: str) -> str:
         return " ".join(value.casefold().split())
+
+    def _list_fragments(self, *, kind: FragmentKind | None = None) -> list[MemoryFragment]:
+        if kind is None:
+            rows = self._conn.execute(
+                "SELECT * FROM memory_fragments ORDER BY created_at, fragment_id"
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT * FROM memory_fragments WHERE kind = ? ORDER BY created_at, fragment_id",
+                (kind.value,),
+            ).fetchall()
+        return [self._row_to_fragment(row) for row in rows]
+
+    def _row_to_fragment(self, row: sqlite3.Row) -> MemoryFragment:
+        return MemoryFragment(
+            fragment_id=row["fragment_id"],
+            kind=FragmentKind(row["kind"]),
+            mem_ids=tuple(json.loads(row["mem_ids_json"])),
+            title=row["title"],
+            text=row["text"],
+            token_count_estimate=row["token_count_estimate"],
+            created_at=datetime_from_str(row["created_at"]),
+            updated_at=datetime_from_str(row["updated_at"]),
+        )
+
+    def _item_token_estimate(self, item: MemoryItem) -> int:
+        return max(1, len(self._fragment_text([item]).split()))
 
     def _fragment_text(self, items: list[MemoryItem]) -> str:
         sections: list[str] = []

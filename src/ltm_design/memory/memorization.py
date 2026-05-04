@@ -122,7 +122,11 @@ class ActiveMemorizationSkill:
         for candidate_id in decision.reject_candidate_ids:
             self.writer.store.reject_candidate(candidate_id)
         for from_mem_id, link in decision.approve_links:
+            if link.relation.value == "same_as":
+                continue
             self.writer.store.add_links(from_mem_id, (link,))
+        for mem_id in mem_ids:
+            self.writer.store.assign_to_recall_fragment(mem_id)
         return tuple(mem_ids)
 
 

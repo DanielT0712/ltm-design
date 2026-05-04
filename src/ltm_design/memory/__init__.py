@@ -14,6 +14,7 @@ from ltm_design.memory.models import (
     SourceAnchorRef,
 )
 from ltm_design.memory.store import MemoryStore
+from ltm_design.memory.tools import MemoryTools
 
 __all__ = [
     "EvidenceRef",
@@ -28,4 +29,5 @@ __all__ = [
     "SourceSpan",
     "SourceAnchorRef",
     "MemoryStore",
+    "MemoryTools",
 ]
