@@ -14,8 +14,11 @@ class FakeChatClient:
 
     def chat(self, *, model: str, messages: list[ChatMessage], temperature: float = 0.0) -> str:
         self.calls.append((model, messages))
-        system = messages[0].content
-        if "memory cataloger" in system:
+        prompt_text = "\n\n".join(message.content for message in messages)
+        if "memory cataloger" in prompt_text:
+            assert messages[0].role == "user"
+            assert messages[1].role == "developer"
+            assert "MEMORY CATALOGER SKILL PROMPT" in messages[1].content
             return json.dumps(
                 {
                     "memories": [
@@ -29,17 +32,17 @@ class FakeChatClient:
                     "processed_through": "[src:thread_1 msg:u_1]",
                 }
             )
-        if "memory connection checker" in system:
-            existing_mem_id = re.search(r"^mem_id: (mem_[^\n]+)", messages[1].content, re.MULTILINE).group(1)
+        if "memory connection checker" in prompt_text:
+            existing_mem_id = re.search(r"^mem_id: ([^\n]+)", messages[1].content, re.MULTILINE).group(1)
             return json.dumps({"connections": [{"new_memory_index": 0, "existing_mem_id": existing_mem_id, "relation": "same_as"}]})
-        if "memory connection summarizer" in system:
-            existing_mem_id = re.search(r"^mem_id: (mem_[^\n]+)", messages[1].content, re.MULTILINE).group(1)
+        if "memory connection summarizer" in prompt_text:
+            existing_mem_id = re.search(r"^mem_id: ([^\n]+)", messages[1].content, re.MULTILINE).group(1)
             assert "CONNECTED EXISTING MEMORIES" not in messages[1].content
             assert "proposed_connections: new_memory_index 0: same_as" in messages[1].content
             return f"0:\nThis is redundant with the existing memory that the user wants \"same_as memories thrown away instead of written\" (id: {existing_mem_id}, same_as)."
-        if "continuing the memory cataloging task" in system:
+        if "continuing the memory cataloging task" in prompt_text:
             assert re.match(
-                r"^0:\nThis is redundant with the existing memory .*\(id: mem_[^,]+, same_as\)\.$",
+                r"^0:\nThis is redundant with the existing memory .*\(id: [^,]+, same_as\)\.$",
                 messages[1].content,
             )
             assert "CATALOG" not in messages[1].content
@@ -50,12 +53,12 @@ class FakeChatClient:
                     "approve_links": [],
                 }
             )
-        if "checking a group of memory items" in system:
-            payload = json.loads(messages[1].content)
-            return json.dumps({"memories": [{"mem_id": payload["memory_items"][0]["mem_id"], "relevant": True, "memory_tags": ["dedupe"], "descriptors": ["relevant"], "reason": "matches"}]})
-        if "selecting useful memory context" in system:
+        if "checking a group of memory items" in prompt_text:
+            mem_id = re.search(r"^mem_id: ([^\n]+)", messages[1].content, re.MULTILINE).group(1)
+            return json.dumps({"memories": [{"mem_id": mem_id, "relevant": True, "memory_tags": ["dedupe"], "descriptors": ["relevant"], "reason": "matches"}]})
+        if "selecting useful memory context" in prompt_text:
             return "The user wants same_as memories thrown away [mem_existing]."
-        raise AssertionError(system)
+        raise AssertionError(prompt_text)
 
 
 def test_orchestrator_uses_pro_for_main_and_flash_for_workers(tmp_path):
@@ -104,10 +107,10 @@ def test_orchestrator_approves_cataloged_memories_by_default(tmp_path):
 
     class DefaultApproveChatClient(FakeChatClient):
         def chat(self, *, model: str, messages: list[ChatMessage], temperature: float = 0.0) -> str:
-            system = messages[0].content
-            if "continuing the memory cataloging task" in system:
+            prompt_text = "\n\n".join(message.content for message in messages)
+            if "continuing the memory cataloging task" in prompt_text:
                 return json.dumps({"reject_memories": [], "approve_links": []})
-            if "memory connection checker" in system or "memory connection summarizer" in system:
+            if "memory connection checker" in prompt_text or "memory connection summarizer" in prompt_text:
                 raise AssertionError("no existing fragments should mean no connection workers")
             return super().chat(model=model, messages=messages, temperature=temperature)
 

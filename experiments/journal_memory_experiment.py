@@ -22,9 +22,10 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from ltm_design.llm.client import ChatMessage, DeepSeekClient  # noqa: E402
+from ltm_design.llm.client import ChatMessage, DeepSeekClient, parse_json_object  # noqa: E402
 from ltm_design.memory.models import EvidenceRecord  # noqa: E402
 from ltm_design.memory.orchestrator import MemoryModels, MemoryOrchestrator  # noqa: E402
+from ltm_design.memory.prompts import MAIN_CONVERSATION_MEMORY_TRIGGER_PROMPT  # noqa: E402
 from ltm_design.memory.store import MemoryStore  # noqa: E402
 
 
@@ -41,9 +42,8 @@ EXPERIMENT_INSTRUCTION = """\
 Temporary experiment instruction for the main conversation model:
 Treat each journal entry as if the user has just shared it in a conversation. For this test only,
 call the memory-cataloging agent after each journal entry so durable, future-useful details can
-be stored. When several journal entries appear in one conversation chunk, do not add extra
-intervention or special branching logic; process the transcript normally using processed_through
-and evidence_range.
+be stored. For experiment observability, respond with JSON:
+{"call_memory_storage": true, "processed_through": "the last source marker already processed before this call"}
 """
 
 
@@ -150,17 +150,22 @@ class ExperimentDeterministicChatClient:
     """Local stand-in that exercises storage flow when external model auth is unavailable."""
 
     def chat(self, *, model: str, messages: list[ChatMessage], temperature: float = 0.0) -> str:
-        system = messages[0].content
-        if "memory cataloger" in system:
-            payload = json.loads(messages[-1].content)
+        prompt_text = "\n\n".join(message.content for message in messages)
+        if "memory cataloger" in prompt_text:
+            payload = {
+                "evidence_range": "\n\n".join(message.content for message in messages if message.role == "user"),
+                "processed_through": self._field_from_skill_prompt(prompt_text, "processed_through"),
+            }
             return json.dumps(self._catalog(payload))
-        if "memory connection checker" in system:
+        if "Memory trigger policy for the live conversation model" in prompt_text:
+            return json.dumps({"call_memory_storage": True, "processed_through": ""})
+        if "memory connection checker" in prompt_text:
             return json.dumps({"connections": []})
-        if "memory connection summarizer" in system:
+        if "memory connection summarizer" in prompt_text:
             return ""
-        if "continuing the memory cataloging task" in system:
+        if "continuing the memory cataloging task" in prompt_text:
             return json.dumps({"reject_memories": [], "approve_links": []})
-        if "checking a group of memory items" in system:
+        if "checking a group of memory items" in prompt_text:
             payload = json.loads(messages[-1].content)
             return json.dumps({
                 "memories": [
@@ -175,13 +180,17 @@ class ExperimentDeterministicChatClient:
                     if item.get("mem_id")
                 ]
             })
-        if "selecting useful memory context" in system:
+        if "selecting useful memory context" in prompt_text:
             payload = json.loads(messages[-1].content)
             return "\n".join(
                 f"- {item['text']} ({item['mem_id']})"
                 for item in payload.get("candidate_memory_items", [])
             )
         raise RuntimeError("unhandled deterministic chat prompt")
+
+    def _field_from_skill_prompt(self, text: str, field: str) -> str:
+        match = re.search(rf"^{re.escape(field)}: (.*)$", text, flags=re.M)
+        return match.group(1) if match else ""
 
     def _catalog(self, payload: dict) -> dict:
         evidence_range = payload["evidence_range"]
@@ -234,17 +243,23 @@ class RecordingChatClient:
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.counter = 0
+        self.context: dict = {}
+
+    def set_context(self, **values: object) -> None:
+        self.context = dict(values)
 
     def chat(self, *, model: str, messages: list[ChatMessage], temperature: float = 0.0) -> str:
         self.counter += 1
         started = datetime.now(timezone.utc)
-        role = prompt_role(messages[0].content if messages else "")
+        role = prompt_role("\n\n".join(message.content for message in messages))
         record = {
             "call_id": f"call_{self.counter:04d}",
             "started_at": started.isoformat(),
             "model": model,
             "temperature": temperature,
             "role": role,
+            "branch": "memory_storage_skill" if role in {"cataloger", "connection_fragment", "connection_summarizer", "storage_decision"} else "main",
+            "context": self.context,
             "messages": [asdict(message) for message in messages],
         }
         try:
@@ -267,6 +282,8 @@ class RecordingChatClient:
 def prompt_role(system_prompt: str) -> str:
     if "memory cataloger" in system_prompt:
         return "cataloger"
+    if "Memory trigger policy for the live conversation model" in system_prompt:
+        return "main_trigger"
     if "memory connection checker" in system_prompt:
         return "connection_fragment"
     if "memory connection summarizer" in system_prompt:
@@ -278,6 +295,13 @@ def prompt_role(system_prompt: str) -> str:
     if "selecting useful memory context" in system_prompt:
         return "retrieval_summarizer"
     return "unknown"
+
+
+def parse_json_loose(text: str) -> dict:
+    try:
+        return parse_json_object(text)
+    except Exception:
+        return {}
 
 
 def fetch_url(url: str, *, retries: int = 3, sleep_s: float = 0.25) -> str:
@@ -405,6 +429,19 @@ def transcript_for(entries: list[JournalEntry]) -> str:
     return "\n\n".join(chunks)
 
 
+def main_user_message_for(entry: JournalEntry) -> ChatMessage:
+    return ChatMessage(
+        role="user",
+        content="\n".join(
+            [
+                entry.source_marker,
+                f"User journal entry dated {entry.title}.",
+                entry.text,
+            ]
+        ),
+    )
+
+
 def add_evidence(store: MemoryStore, entry: JournalEntry) -> None:
     store.add_evidence(
         EvidenceRecord(
@@ -456,17 +493,42 @@ def run_memory(batch_size: int, max_entries: int | None, chat: str, main_model: 
         models=MemoryModels(main=main_model, worker=worker_model),
     )
     processed_through = state.get("processed_through", "")
+    main_messages: list[ChatMessage] = [
+        ChatMessage(
+            role="system",
+            content="\n\n".join([MAIN_CONVERSATION_MEMORY_TRIGGER_PROMPT, EXPERIMENT_INSTRUCTION]),
+        )
+    ]
+    for entry in entries:
+        if entry.source_id in completed:
+            main_messages.append(main_user_message_for(entry))
 
     for start in range(0, len(pending), batch_size):
         batch = pending[start:start + batch_size]
         for entry in batch:
             add_evidence(store, entry)
-        evidence_range = transcript_for(batch)
         print(f"processing {batch[0].title} .. {batch[-1].title} ({len(batch)} entries)", flush=True)
+        for entry in batch:
+            main_messages.append(main_user_message_for(entry))
+        chat_client.set_context(
+            entry_titles=[entry.title for entry in batch],
+            entry_source_ids=[entry.source_id for entry in batch],
+            conversation_entries=sum(1 for message in main_messages if message.role == "user"),
+            processed_through_before=processed_through,
+        )
+        trigger_text = chat_client.chat(
+            model=main_model,
+            messages=list(main_messages),
+        )
+        trigger = parse_json_loose(trigger_text)
+        if not trigger.get("call_memory_storage", True):
+            print("main model did not call memory storage; skipping storage branch", flush=True)
+            continue
         result = orchestrator.process_memory_skill(
-            processed_through=processed_through,
-            evidence_range=evidence_range,
-            recent_context=EXPERIMENT_INSTRUCTION,
+            processed_through=trigger.get("processed_through") or processed_through,
+            evidence_range="",
+            recent_context="",
+            conversation_messages=list(main_messages),
         )
         processed_through = batch[-1].source_marker
         completed.update(entry.source_id for entry in batch)
@@ -532,109 +594,98 @@ def generate_report() -> None:
         "calls": calls,
         "state": state,
         "db": db,
+        "meta": {
+            "main_trigger_prompt": MAIN_CONVERSATION_MEMORY_TRIGGER_PROMPT,
+            "experiment_instruction": EXPERIMENT_INSTRUCTION,
+            "main_model_call_simulated": False,
+        },
     }
     REPORT_HTML.write_text(render_report_html(data), encoding="utf-8")
     print(f"wrote report to {REPORT_HTML}")
 
 
 def render_report_html(data: dict) -> str:
-    payload = json.dumps(data, ensure_ascii=False)
+    payload = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
     return f"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Memory Experiment Browser</title>
+<title>Memory Storage Timeline</title>
 <style>
-:root {{ color-scheme: light; --ink:#1f2933; --muted:#667085; --line:#d8dee8; --panel:#f7f8fb; --accent:#0f766e; --warn:#a16207; }}
+:root {{ color-scheme: light; --ink:#1f2933; --muted:#667085; --line:#d5dbe7; --panel:#f7f8fb; --main:#155e75; --skill:#7c2d12; --worker:#365314; --merge:#5b21b6; --decision:#9f1239; }}
 * {{ box-sizing:border-box; }}
-body {{ margin:0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color:var(--ink); background:#fff; }}
-header {{ padding:16px 20px; border-bottom:1px solid var(--line); display:flex; align-items:center; justify-content:space-between; gap:16px; }}
-h1 {{ margin:0; font-size:20px; font-weight:700; }}
-main {{ display:grid; grid-template-columns:280px minmax(0,1fr); min-height:calc(100vh - 65px); }}
-aside {{ border-right:1px solid var(--line); padding:14px; background:var(--panel); overflow:auto; }}
-.content {{ padding:16px 20px 32px; overflow:auto; }}
-.tabs {{ display:flex; flex-wrap:wrap; gap:8px; margin-bottom:12px; }}
-button {{ border:1px solid var(--line); background:#fff; color:var(--ink); border-radius:6px; padding:7px 10px; cursor:pointer; font:inherit; }}
-button.active {{ background:var(--accent); color:#fff; border-color:var(--accent); }}
-input {{ width:100%; border:1px solid var(--line); border-radius:6px; padding:8px 10px; font:inherit; margin-bottom:12px; }}
-.stats {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); gap:8px; margin-bottom:14px; }}
-.stat {{ border:1px solid var(--line); border-radius:8px; padding:10px; background:#fff; }}
-.stat b {{ display:block; font-size:20px; }}
-.list {{ display:grid; gap:8px; }}
-.item {{ border:1px solid var(--line); border-radius:8px; padding:10px; background:#fff; cursor:pointer; }}
-.item:hover {{ border-color:var(--accent); }}
-.item .meta, .muted {{ color:var(--muted); font-size:12px; }}
-.grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:12px; align-items:start; }}
-.panel {{ border:1px solid var(--line); border-radius:8px; padding:12px; background:#fff; }}
-.panel h2 {{ margin:0 0 8px; font-size:16px; }}
-pre {{ white-space:pre-wrap; overflow:auto; background:#111827; color:#f9fafb; padding:12px; border-radius:8px; font-size:12px; line-height:1.45; max-height:520px; }}
-.pill {{ display:inline-block; border:1px solid var(--line); border-radius:999px; padding:2px 7px; font-size:12px; margin:2px 4px 2px 0; }}
-.linkrow {{ display:flex; align-items:center; gap:8px; padding:6px 0; border-bottom:1px solid #eef1f5; }}
-.linkrow span:nth-child(2) {{ color:var(--warn); font-weight:600; }}
-.call-ok {{ color:var(--accent); font-weight:700; }}
-.call-bad {{ color:#b42318; font-weight:700; }}
+body {{ margin:0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color:var(--ink); background:#fbfcfe; }}
+header {{ position:sticky; top:0; z-index:10; display:flex; justify-content:space-between; gap:20px; align-items:center; padding:14px 22px; border-bottom:1px solid var(--line); background:rgba(255,255,255,.96); backdrop-filter:blur(8px); }}
+h1 {{ margin:0; font-size:20px; }}
+.toolbar {{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; }}
+input {{ width:280px; max-width:44vw; border:1px solid var(--line); border-radius:6px; padding:8px 10px; font:inherit; }}
+button {{ border:1px solid var(--line); background:#fff; border-radius:6px; padding:7px 10px; font:inherit; cursor:pointer; }}
+button.active {{ background:#111827; color:#fff; border-color:#111827; }}
+main {{ max-width:1280px; margin:0 auto; padding:18px 22px 80px; }}
+.summary {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin-bottom:20px; }}
+.stat {{ background:#fff; border:1px solid var(--line); border-radius:8px; padding:10px; }}
+.stat b {{ display:block; font-size:22px; }}
+.muted {{ color:var(--muted); font-size:12px; }}
+.timeline {{ position:relative; margin-left:18px; }}
+.timeline::before {{ content:""; position:absolute; top:0; bottom:0; left:18px; border-left:2px solid #cbd5e1; }}
+.turn {{ position:relative; margin:0 0 28px 54px; }}
+.turn-marker {{ position:absolute; left:-46px; top:12px; width:28px; height:28px; border-radius:50%; background:#fff; border:3px solid var(--main); }}
+.turn-card {{ background:#fff; border:1px solid var(--line); border-radius:8px; overflow:hidden; box-shadow:0 1px 2px rgba(15,23,42,.04); }}
+.turn-head {{ padding:12px 14px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; gap:12px; align-items:baseline; }}
+.turn-head h2 {{ margin:0; font-size:17px; }}
+.section {{ padding:12px 14px; border-bottom:1px solid #eef2f7; }}
+.section:last-child {{ border-bottom:0; }}
+.label {{ display:inline-flex; align-items:center; gap:6px; font-size:12px; font-weight:700; text-transform:uppercase; letter-spacing:.04em; color:#475467; margin-bottom:8px; }}
+.branch {{ margin:12px 0 0 18px; padding-left:20px; border-left:3px solid var(--skill); }}
+.branch-title {{ margin:0 0 10px; color:var(--skill); font-weight:800; }}
+.node {{ background:#fff; border:1px solid var(--line); border-radius:8px; margin:10px 0; overflow:hidden; }}
+.node.cataloger {{ border-left:5px solid var(--skill); }}
+.node.fragment {{ border-left:5px solid var(--worker); }}
+.node.summarizer {{ border-left:5px solid var(--merge); }}
+.node.decision {{ border-left:5px solid var(--decision); }}
+.node-head {{ padding:10px 12px; background:#f8fafc; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; gap:12px; align-items:baseline; }}
+.node-head h3 {{ margin:0; font-size:15px; }}
+pre {{ margin:0; white-space:pre-wrap; overflow:auto; max-height:720px; background:#101828; color:#f8fafc; border-radius:6px; padding:10px; font-size:12px; line-height:1.45; }}
+.call-body {{ padding:10px; }}
+.synthetic {{ border-left:5px solid var(--main); }}
+.fragments {{ display:block; }}
+.connector {{ margin:8px 0 2px; color:#667085; font-size:12px; text-align:center; }}
+.flow {{ padding:12px 14px; }}
+.flow pre {{ max-height:680px; background:#0f172a; }}
+.branch-marker {{ margin:12px 0; padding:10px 12px; border:1px dashed var(--skill); border-radius:8px; background:#fff7ed; color:var(--skill); font-weight:800; }}
+.hidden {{ display:none !important; }}
+@media (max-width:900px) {{ .turn {{ margin-left:42px; }} input {{ max-width:100%; width:100%; }} header {{ align-items:flex-start; flex-direction:column; }} }}
 </style>
 </head>
 <body>
 <header>
-  <h1>Memory Experiment Browser</h1>
-  <div class="muted" id="state"></div>
+  <div>
+    <h1>Memory Storage Timeline</h1>
+    <div class="muted" id="state"></div>
+  </div>
+  <div class="toolbar">
+    <input id="filter" placeholder="Filter timeline text">
+    <button id="collapseFragments">Collapse Fragments</button>
+    <button id="expandAll">Expand All</button>
+  </div>
 </header>
 <main>
-  <aside>
-    <input id="search" placeholder="Filter visible items">
-    <div class="tabs" id="tabs"></div>
-    <div class="list" id="nav"></div>
-  </aside>
-  <section class="content">
-    <div class="stats" id="stats"></div>
-    <div id="detail"></div>
-  </section>
+  <section class="summary" id="summary"></section>
+  <section class="timeline" id="timeline"></section>
 </main>
 <script>
 const DATA = {payload};
-const tabs = ["overview","entries","calls","memories","links","fragments","candidates"];
-let tab = "overview";
-let selected = null;
 const $ = id => document.getElementById(id);
 const esc = value => String(value ?? "").replace(/[&<>]/g, ch => ({{"&":"&amp;","<":"&lt;",">":"&gt;"}}[ch]));
 const clip = (value, n=120) => {{
   value = String(value ?? "").replace(/\\s+/g, " ").trim();
   return value.length > n ? value.slice(0, n - 1) + "…" : value;
 }};
-function rowsFor(name) {{
-  if (name === "entries") return DATA.entries;
-  if (name === "calls") return DATA.calls;
-  if (name === "memories") return DATA.db.memory_items;
-  if (name === "links") return DATA.db.memory_links;
-  if (name === "fragments") return DATA.db.memory_fragments;
-  if (name === "candidates") return DATA.db.pending_memory_candidates;
-  return [];
+function roleCounts() {{
+  return DATA.calls.reduce((acc, call) => (acc[call.role]=(acc[call.role]||0)+1, acc), {{}});
 }}
-function titleFor(name, item, i) {{
-  if (name === "entries") return item.title;
-  if (name === "calls") return `${{item.call_id}} · ${{item.role}} · ${{item.model}}`;
-  if (name === "memories") return item.mem_id;
-  if (name === "links") return `${{item.from_mem_id}} → ${{item.to_mem_id}}`;
-  if (name === "fragments") return item.fragment_id;
-  if (name === "candidates") return item.candidate_id;
-  return String(i + 1);
-}}
-function subtitleFor(name, item) {{
-  if (name === "entries") return clip(item.text);
-  if (name === "calls") return `${{item.ok ? "ok" : "error"}} · ${{item.duration_s}}s · ${{clip(item.response, 90)}}`;
-  if (name === "memories") return clip(item.text);
-  if (name === "links") return item.relation;
-  if (name === "fragments") return `${{item.kind}} · ${{JSON.parse(item.mem_ids_json || "[]").length}} memories · ${{item.token_count_estimate}} tokens est.`;
-  if (name === "candidates") return `${{item.status}} · ${{clip(item.text)}}`;
-  return "";
-}}
-function renderTabs() {{
-  $("tabs").innerHTML = tabs.map(name => `<button class="${{name===tab ? "active" : ""}}" onclick="setTab('${{name}}')">${{name}}</button>`).join("");
-}}
-function setTab(name) {{ tab = name; selected = null; render(); }}
-function renderStats() {{
+function renderSummary() {{
   const roleCounts = DATA.calls.reduce((acc, call) => (acc[call.role]=(acc[call.role]||0)+1, acc), {{}});
   const stats = [
     ["entries", DATA.entries.length],
@@ -644,67 +695,131 @@ function renderStats() {{
     ["fragments", DATA.db.memory_fragments.length],
     ["processed", (DATA.state.completed_source_ids || []).length],
   ];
-  $("stats").innerHTML = stats.map(([k,v]) => `<div class="stat"><b>${{v}}</b><span class="muted">${{k}}</span></div>`).join("")
+  $("summary").innerHTML = stats.map(([k,v]) => `<div class="stat"><b>${{v}}</b><span class="muted">${{k}}</span></div>`).join("")
     + `<div class="stat"><b>${{Object.entries(roleCounts).map(([k,v]) => `${{k}}:${{v}}`).join(" ") || "none"}}</b><span class="muted">call roles</span></div>`;
   $("state").textContent = DATA.state.processed_through || "no processed pointer";
 }}
-function renderNav() {{
-  if (tab === "overview") {{ $("nav").innerHTML = ""; return; }}
-  const q = $("search").value.toLowerCase();
-  const rows = rowsFor(tab);
-  $("nav").innerHTML = rows.map((item, i) => ({{item, i, text: JSON.stringify(item).toLowerCase()}}))
-    .filter(x => !q || x.text.includes(q))
-    .map(x => `<div class="item" onclick="selectItem(${{x.i}})"><b>${{esc(titleFor(tab,x.item,x.i))}}</b><div class="meta">${{esc(subtitleFor(tab,x.item))}}</div></div>`)
-    .join("");
+function groupBranches() {{
+  const groups = [];
+  const byKey = new Map();
+  for (const call of DATA.calls) {{
+    const ctx = call.context || {{}};
+    const key = (ctx.entry_source_ids || ["unknown"]).join(",");
+    if (!byKey.has(key)) {{
+      const title = (ctx.entry_titles || [key])[0] || key;
+      byKey.set(key, {{title, context: ctx, calls: []}});
+      groups.push(byKey.get(key));
+    }}
+    byKey.get(key).calls.push(call);
+  }}
+  return groups;
 }}
-function selectItem(i) {{ selected = i; renderDetail(); }}
-function renderOverview() {{
-  const callsByRole = DATA.calls.reduce((acc, call) => (acc[call.role] = (acc[call.role] || 0) + 1, acc), {{}});
-  $("detail").innerHTML = `<div class="grid">
-    <div class="panel"><h2>Run State</h2><pre>${{esc(JSON.stringify(DATA.state, null, 2))}}</pre></div>
-    <div class="panel"><h2>Model Calls By Role</h2><pre>${{esc(JSON.stringify(callsByRole, null, 2))}}</pre></div>
-    <div class="panel"><h2>Memory Graph</h2>${{DATA.db.memory_links.map(link => `<div class="linkrow"><span>${{esc(link.from_mem_id)}}</span><span>${{esc(link.relation)}}</span><span>${{esc(link.to_mem_id)}}</span></div>`).join("") || "<p class='muted'>No links.</p>"}}</div>
+function messageContent(call, role) {{
+  const match = (call.messages || []).find(message => message.role === role);
+  return match ? match.content : "";
+}}
+function mainConversationThrough(group) {{
+  const wanted = new Set(group.context.entry_source_ids || []);
+  const currentIndex = DATA.entries.findIndex(entry => wanted.has(entry.source_id));
+  const visible = currentIndex < 0 ? DATA.entries : DATA.entries.slice(0, currentIndex + 1);
+  return visible.map((entry, index) => [
+    `Prompt ${{index + 1}}`,
+    entry.source_marker,
+    `User journal entry dated ${{entry.title}}.`,
+    entry.text,
+    "(main model response: temporary experiment instruction calls memory storage skill after the journal entry)"
+  ].join("\\n")).join("\\n\\n");
+}}
+function callTranscript(call) {{
+  const parts = [];
+  for (const [index, message] of (call.messages || []).entries()) {{
+    parts.push(`>>> MESSAGE ${{index + 1}} · role=${{message.role}}\\n${{message.content || ""}}`);
+  }}
+  parts.push(`<<< RESPONSE · ${{call.ok ? "ok" : "error"}}\\n${{call.response || call.error || ""}}`);
+  return parts.join("\\n\\n");
+}}
+function syntheticMainTranscript(group, index) {{
+  const entry = DATA.entries.find(item => (group.context.entry_source_ids || []).includes(item.source_id));
+  return [
+    "!!! HARNESS-SIMULATED MAIN MODEL TURN",
+    "No real main model trigger call was made in this run. The harness directly invoked memory storage after each journal entry.",
+    "",
+    ">>> SYSTEM / TRIGGER POLICY THAT SHOULD CONTROL SKILL CALLING",
+    DATA.meta.main_trigger_prompt || "",
+    "",
+    ">>> TEMPORARY EXPERIMENT INSTRUCTION",
+    DATA.meta.experiment_instruction || "",
+    "",
+    `>>> MAIN CONVERSATION HISTORY THROUGH PROMPT ${{index + 1}}`,
+    mainConversationThrough(group),
+    "",
+    "<<< SIMULATED MAIN RESPONSE",
+    "call memory-cataloging skill"
+  ].join("\\n");
+}}
+function renderCallNode(call) {{
+  return `<div class="node ${{call.role === "main_trigger" ? "synthetic" : call.role === "cataloger" ? "cataloger" : call.role === "connection_fragment" ? "fragment" : call.role === "connection_summarizer" ? "summarizer" : "decision"}}">
+    <div class="node-head"><h3>${{esc(call.call_id)}} · ${{esc(call.role)}}</h3><span class="muted">${{esc(call.model)}} · ${{esc(call.duration_s)}}s</span></div>
+    <div class="call-body"><pre>${{esc(callTranscript(call))}}</pre></div>
   </div>`;
 }}
-function renderCall(item) {{
-  const msgs = item.messages || [];
-  return `<div class="grid">
-    <div class="panel"><h2>${{esc(item.call_id)}} <span class="${{item.ok ? "call-ok" : "call-bad"}}">${{item.ok ? "ok" : "error"}}</span></h2>
-      <div class="muted">${{esc(item.role)}} · ${{esc(item.model)}} · ${{esc(item.duration_s)}}s</div>
-      <h2>System</h2><pre>${{esc(msgs[0]?.content || "")}}</pre>
-      <h2>User</h2><pre>${{esc(msgs[1]?.content || "")}}</pre>
+function renderSyntheticMainNode(group, index) {{
+  return `<div class="node synthetic"><div class="node-head"><h3>main prompt ${{index + 1}} · simulated trigger</h3><span class="muted">not a recorded model call</span></div><div class="call-body"><pre>${{esc(syntheticMainTranscript(group, index))}}</pre></div></div>`;
+}}
+function renderTurn(group, index) {{
+  const entry = DATA.entries.find(item => (group.context.entry_source_ids || []).includes(item.source_id));
+  const calls = group.calls;
+  const mainTrigger = calls.find(call => call.role === "main_trigger");
+  const cataloger = calls.find(call => call.role === "cataloger");
+  const fragments = calls.filter(call => call.role === "connection_fragment");
+  const summarizer = calls.find(call => call.role === "connection_summarizer");
+  const decision = calls.find(call => call.role === "storage_decision");
+  const catalogerHtml = cataloger ? renderCallNode(cataloger) : "";
+  const fragmentHtml = fragments.map(call => renderCallNode(call)).join("");
+  const summarizerHtml = summarizer ? `<div class="connector">fragment branches merge into summarizer</div>${{renderCallNode(summarizer)}}` : `<div class="connector">no summarizer call: no connected ids</div>`;
+  const decisionHtml = decision ? `<div class="connector">summarizer output returns to storage decision</div>${{renderCallNode(decision)}}` : "";
+  return `<article class="turn" data-search="${{esc(JSON.stringify(group).toLowerCase())}}">
+    <div class="turn-marker"></div>
+    <div class="turn-card">
+      <div class="turn-head"><h2>Prompt ${{index + 1}} · ${{esc(group.title)}}</h2><span class="muted">${{calls.length}} model calls</span></div>
+      <div class="section flow">
+        <span class="label">Main Conversation / Skill Trigger</span>
+        ${{mainTrigger ? renderCallNode(mainTrigger) : renderSyntheticMainNode(group, index)}}
+        <div class="branch-marker">↳ storage skill branch starts here</div>
+      </div>
+      <div class="section branch">
+        <p class="branch-title">Branch: memory storage skill called from prompt ${{index + 1}}</p>
+        ${{catalogerHtml}}
+        <div class="connector">cataloger output fans out to ${{fragments.length}} fixed-fragment checker branches</div>
+        <div class="fragments">${{fragmentHtml || "<p class='muted'>No fragment branches for this turn.</p>"}}</div>
+        ${{summarizerHtml}}
+        ${{decisionHtml}}
+      </div>
+      <div class="section">
+        <span class="label">Return To Original Branch</span>
+        <pre>Storage branch complete. The next journal entry is appended to the original conversation branch, not to the storage skill branch.</pre>
+      </div>
     </div>
-    <div class="panel"><h2>Response</h2><pre>${{esc(item.response || item.error || "")}}</pre></div>
-  </div>`;
+  </article>`;
 }}
-function renderMemory(item) {{
-  return `<div class="grid">
-    <div class="panel"><h2>${{esc(item.mem_id)}}</h2><p>${{esc(item.text)}}</p><h2>Facets</h2><pre>${{esc(item.facets_json)}}</pre></div>
-    <div class="panel"><h2>Evidence</h2><pre>${{esc(item.evidence_json)}}</pre><h2>Raw</h2><pre>${{esc(JSON.stringify(item,null,2))}}</pre></div>
-  </div>`;
+function renderTimeline() {{
+  $("timeline").innerHTML = groupBranches().map(renderTurn).join("");
 }}
-function renderFragment(item) {{
-  return `<div class="grid"><div class="panel"><h2>${{esc(item.fragment_id)}}</h2><div class="muted">${{esc(item.kind)}} · ${{esc(item.token_count_estimate)}} tokens est.</div><pre>${{esc(item.text)}}</pre></div><div class="panel"><h2>Memory IDs</h2><pre>${{esc(JSON.stringify(JSON.parse(item.mem_ids_json || "[]"), null, 2))}}</pre></div></div>`;
+function applyFilter() {{
+  const q = $("filter").value.trim().toLowerCase();
+  document.querySelectorAll(".turn").forEach(turn => {{
+    turn.classList.toggle("hidden", q && !turn.dataset.search.includes(q));
+  }});
 }}
-function renderEntry(item) {{
-  return `<div class="panel"><h2>${{esc(item.title)}}</h2><div class="muted">${{esc(item.url)}}</div><pre>${{esc(item.text)}}</pre></div>`;
-}}
-function renderGeneric(item) {{ return `<div class="panel"><pre>${{esc(JSON.stringify(item, null, 2))}}</pre></div>`; }}
-function renderDetail() {{
-  if (tab === "overview") return renderOverview();
-  const rows = rowsFor(tab);
-  const item = rows[selected ?? 0];
-  if (!item) {{ $("detail").innerHTML = "<p class='muted'>No item selected.</p>"; return; }}
-  if (tab === "calls") $("detail").innerHTML = renderCall(item);
-  else if (tab === "memories") $("detail").innerHTML = renderMemory(item);
-  else if (tab === "fragments") $("detail").innerHTML = renderFragment(item);
-  else if (tab === "entries") $("detail").innerHTML = renderEntry(item);
-  else $("detail").innerHTML = renderGeneric(item);
-}}
-function render() {{ renderTabs(); renderStats(); renderNav(); renderDetail(); }}
-$("search").addEventListener("input", renderNav);
+function render() {{ renderSummary(); renderTimeline(); applyFilter(); }}
+$("filter").addEventListener("input", applyFilter);
+$("collapseFragments").addEventListener("click", () => document.body.classList.toggle("fragments-collapsed"));
+$("expandAll").addEventListener("click", () => document.querySelectorAll("pre").forEach(pre => pre.style.maxHeight = "none"));
 render();
 </script>
+<style>
+body.fragments-collapsed .node.fragment .call-body {{ display:none; }}
+</style>
 </body>
 </html>
 """

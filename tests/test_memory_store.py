@@ -175,7 +175,7 @@ def test_assign_to_recall_fragment_prefers_connected_fragment_with_space(tmp_pat
     assert assigned.mem_ids == (connected.mem_id, new.mem_id)
 
 
-def test_assign_to_recall_fragment_uses_most_empty_when_no_connections(tmp_path):
+def test_assign_to_recall_fragment_uses_most_space_when_no_connection_fragments_fit(tmp_path):
     store = MemoryStore(tmp_path / "memory.db")
     fuller_a = store.remember(MemoryCandidate(text="A " * 10))
     fuller_b = store.remember(MemoryCandidate(text="B " * 10))
@@ -196,6 +196,53 @@ def test_assign_to_recall_fragment_uses_most_empty_when_no_connections(tmp_path)
 
     assert assigned.title == "emptier"
     assert assigned.mem_ids == (emptier.mem_id, new.mem_id)
+    fragments = store.list_fragments(kind=FragmentKind.RECALL)
+    assert all(fragment.title != "emptier" or fragment.fragment_id == assigned.fragment_id for fragment in fragments)
+
+
+def test_assign_to_recall_fragment_skips_full_connected_fragment_for_most_space(tmp_path):
+    store = MemoryStore(tmp_path / "memory.db")
+    connected = store.remember(MemoryCandidate(text="Connected " * 12))
+    roomy = store.remember(MemoryCandidate(text="Roomy."))
+    less_roomy = store.remember(MemoryCandidate(text="Less roomy " * 8))
+    new = store.remember(MemoryCandidate(text="New memory."))
+    store.add_links(new.mem_id, (MemoryLink(to_mem_id=connected.mem_id, relation=MemoryRelation.ELABORATES),))
+    store.build_fragment(
+        kind=FragmentKind.RECALL,
+        mem_ids=(connected.mem_id,),
+        title="connected-full",
+    )
+    store.build_fragment(
+        kind=FragmentKind.RECALL,
+        mem_ids=(roomy.mem_id,),
+        title="roomiest",
+    )
+    store.build_fragment(
+        kind=FragmentKind.RECALL,
+        mem_ids=(less_roomy.mem_id,),
+        title="less-roomy",
+    )
+
+    assigned = store.assign_to_recall_fragment(new.mem_id, max_tokens=24)
+
+    assert assigned.title == "roomiest"
+    assert assigned.mem_ids == (roomy.mem_id, new.mem_id)
+
+
+def test_assign_to_recall_fragment_makes_new_when_all_fragments_full(tmp_path):
+    store = MemoryStore(tmp_path / "memory.db")
+    existing = store.remember(MemoryCandidate(text="Existing " * 12))
+    new = store.remember(MemoryCandidate(text="New memory."))
+    store.build_fragment(
+        kind=FragmentKind.RECALL,
+        mem_ids=(existing.mem_id,),
+        title="full",
+    )
+
+    assigned = store.assign_to_recall_fragment(new.mem_id, max_tokens=5)
+
+    assert assigned.title == "New memory."
+    assert assigned.mem_ids == (new.mem_id,)
 
 
 def test_locate_source_span_returns_stable_coordinates():

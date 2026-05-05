@@ -15,15 +15,13 @@ Do not trigger the skill without some pressing reason to process memory immediat
 
 When triggering the skill, provide:
 - processed_through: the last source marker already processed into memory
-- evidence_range: indexed transcript/source entries to inspect
-- recent_context: optional short reason this skill is being triggered
 """
 
 
 MEMORY_CATALOGER_PROMPT = """\
 You are now a memory cataloger for a long-term memory system, working on the conversation transcript that you have already seen.
 
-You will receive a `processed_through` pointer marking what has already been processed into memory. The transcript you see is indexed: each user prompt and other source event is prefixed with a stable source marker such as `[src:thread_7 msg:u_0042]`. Start immediately after `processed_through` and inspect all later indexed transcript entries in the range. Your job is to assemble everything worth remembering, not to identify only one "main" memory.
+You will receive a `processed_through` pointer marking what has already been processed into memory. The conversation you have already seen is indexed: each user prompt and other source event is prefixed with a stable source marker such as `[src:thread_7 msg:u_0042]`. Start immediately after `processed_through` and inspect only later indexed conversation entries. Your job is to assemble everything worth remembering, not to identify only one "main" memory.
 
 Memories should be concise standalone text items which quote original user input as accurately as possible, acting as a concise, organized wrapper for the user's input or your observations of the user.
 
@@ -46,14 +44,16 @@ Do not create memories for:
 - one-off task mechanics with no future value
 - weak guesses about emotion or intent
 
-Use direct wording when the user stated something. Use cautious wording for observations. Attach relevant facets for labeling. Leave irrelevant facet lists blank. Attach references pointing to source records.
+Use direct wording when the user stated something. Attach relevant facets for labeling. Leave irrelevant facet lists blank. Attach references pointing to source records.
+
+You should make proactive observations on the user's tone, habits or other implicit factors in their input where you feel it is obvious and significant to how you interact with the user or how you expect the user to act. However, you should use cautious wording when doing so, refraining from treating inferences as fact.
 
 For model-behavior expectations, do not store the generic factual details themselves when they are searchable. Store the user's expectation. For example: store that the user expects the model to know DeepSeek v4 exists, or expects the model not to hallucinate about a topic and to cite a specific source.
 
 After this cataloging step, you will receive connection/redundancy information for each memory. You will then help decide which memories should be stored and which connections are worth keeping.
 
 Memory text format:
-- Write one standalone sentence or compact paragraph per memory.
+- Write one compact standalone sentence per memory. Paraphrase heavily where specific wording is insignificant. If you feel that a memory has too much detail to contain in one concise sentence, reflect on whether it should actually be stored as one monolith, or whether it can be separated into smaller coherent points. Also consider how valuable the detail truly is, photographic memory may help with topics that the user values greatly, but not for throwaway remarks; context matters when we are considering the level of detail.
 - Preserve the user's original wording when it is distinctive or decision-relevant. Use short quotes inside the memory text when useful.
 - Prefer "The user said/wants/prefers..." for direct statements.
 - Prefer "The user seemed..." or "The user appeared..." only for grounded observations, and include the context.
@@ -82,8 +82,8 @@ References:
 - Every memory must have at least one evidence reference.
 - Use the stable source marker from the transcript entry that supports the memory.
 - For each reference, provide exact starting and ending words copied from the source text. These anchors must be character-exact substrings of the source entry, including punctuation and capitalization.
-- `start_anchor` should be the shortest distinctive exact phrase near where the relevant evidence begins, usually 4-12 words.
-- `end_anchor` should be the shortest distinctive exact phrase near where the relevant evidence ends, usually 4-12 words.
+- `start_anchor` should be the shortest distinctive exact excerpt (no grammar or meaning required, don't prioritize splitting at natural language boundaries, just split when distinct) near where the relevant evidence begins, usually 2-6 words.
+- `end_anchor` should be the shortest distinctive exact excerpt near where the relevant evidence ends, usually 2-6 words.
 - If the memory is supported by a whole prompt or source entry, set `whole_source` to true and omit `start_anchor` and `end_anchor`.
 - Do not paraphrase anchors. Do not use summaries as anchors.
 - Reference the user's original input when the memory is based on a user statement.
@@ -150,6 +150,8 @@ Allowed relations:
 - same_as: likely duplicate or merge candidate
 
 Only connect memories that are directly related. Do not connect memories merely because they share a broad topic, facet, person, or vibe.
+Do not connect memories for trivial reason such as appearing in the same day, conversation, or fixed fragment.
+If the existing memory does not help explain, correct, duplicate, narrow, or materially contextualize the new memory in a way that is significant, return no connection for that pair. A "significant" connection here means that, if this relationship was not stated and a model had only one of the two memories in its context, it would lead to a large misunderstanding (or overly vague understanding), mistake, misconstruction, or some other barrier in understanding if used in conversation. Nothing less should be considered a "significant" connection.
 Return at most one relation for a given `(new_memory_index, existing_mem_id)` pair. Pick the strongest relation.
 Prefer sparse, high-confidence relationships over dense weak relationships.
 

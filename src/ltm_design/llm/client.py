@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import http.client
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -42,7 +43,10 @@ class DeepSeekClient:
             raise RuntimeError("DEEPSEEK_API_KEY is required for model calls")
         payload = {
             "model": model,
-            "messages": [{"role": message.role, "content": message.content} for message in messages],
+            "messages": [
+                {"role": self._api_role(message.role), "content": message.content}
+                for message in messages
+            ],
             "temperature": temperature,
             "stream": self.stream,
         }
@@ -69,7 +73,7 @@ class DeepSeekClient:
                 if exc.code not in {429, 500, 502, 503, 504} or attempt >= self.max_retries:
                     raise RuntimeError(f"DeepSeek request failed: HTTP {exc.code}: {body}") from exc
                 time.sleep(2 ** attempt)
-            except urllib.error.URLError:
+            except (urllib.error.URLError, http.client.RemoteDisconnected, TimeoutError):
                 if attempt >= self.max_retries:
                     raise
                 time.sleep(2 ** attempt)
@@ -111,6 +115,11 @@ class DeepSeekClient:
 
     def _load_env_key(self) -> str | None:
         return self._load_env().get("DEEPSEEK_API_KEY")
+
+    def _api_role(self, role: str) -> str:
+        if role == "developer":
+            return "system"
+        return role
 
     def _load_env(self) -> dict[str, str]:
         env_path = Path.cwd() / ".env"

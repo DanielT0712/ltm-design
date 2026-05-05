@@ -69,11 +69,13 @@ class MemoryOrchestrator:
         processed_through: str,
         evidence_range: str,
         recent_context: str = "",
+        conversation_messages: list[ChatMessage] | None = None,
     ) -> MemorySkillResult:
         catalog = self._catalog_memories(
             processed_through=processed_through,
             evidence_range=evidence_range,
             recent_context=recent_context,
+            conversation_messages=conversation_messages,
         )
         candidates = self._candidates_from_catalog(catalog)
         candidate_ids = [
@@ -132,16 +134,33 @@ class MemoryOrchestrator:
     ) -> RetrievedMemoryContext:
         result = self.search.search(text=f"{user_message}\n{conversation_context}")
         candidate_ids = [candidate.mem_id for candidate in result.candidates[:max_candidates]]
+        fragments = self.store.fragments_containing_mem_ids(
+            candidate_ids,
+            kind=FragmentKind.RECALL,
+            limit=max(1, max_candidates // max(1, group_size)),
+        )
         relevant_ids: list[str] = []
-        for group in self._chunks(candidate_ids, group_size):
-            reply = self._check_relevance(
-                mem_ids=group,
-                user_message=user_message,
-                conversation_context=conversation_context,
-            )
-            for memory in reply.get("memories", []):
-                if memory.get("relevant") and memory.get("mem_id"):
-                    relevant_ids.append(memory["mem_id"])
+        if fragments:
+            for fragment in fragments:
+                reply = self._check_relevance(
+                    mem_ids=list(fragment.mem_ids),
+                    user_message=user_message,
+                    conversation_context=conversation_context,
+                    fragment_id=fragment.fragment_id,
+                )
+                for memory in reply.get("memories", []):
+                    if memory.get("relevant") and memory.get("mem_id"):
+                        relevant_ids.append(memory["mem_id"])
+        else:
+            for group in self._chunks(candidate_ids, group_size):
+                reply = self._check_relevance(
+                    mem_ids=group,
+                    user_message=user_message,
+                    conversation_context=conversation_context,
+                )
+                for memory in reply.get("memories", []):
+                    if memory.get("relevant") and memory.get("mem_id"):
+                        relevant_ids.append(memory["mem_id"])
         relevant_ids = list(dict.fromkeys(relevant_ids))
         if not relevant_ids:
             return RetrievedMemoryContext(text="", mem_ids=())
@@ -152,18 +171,28 @@ class MemoryOrchestrator:
         )
         return RetrievedMemoryContext(text=summary, mem_ids=tuple(relevant_ids))
 
-    def _catalog_memories(self, *, processed_through: str, evidence_range: str, recent_context: str) -> dict:
-        payload = {
-            "processed_through": processed_through,
-            "evidence_range": evidence_range,
-            "recent_context": recent_context,
-        }
+    def _catalog_memories(
+        self,
+        *,
+        processed_through: str,
+        evidence_range: str,
+        recent_context: str,
+        conversation_messages: list[ChatMessage] | None = None,
+    ) -> dict:
+        skill_prompt = "\n\n".join(
+            [
+                "MEMORY CATALOGER SKILL PROMPT",
+                MEMORY_CATALOGER_PROMPT,
+                f"processed_through: {processed_through}",
+            ]
+        )
+        messages = list(conversation_messages) if conversation_messages is not None else [
+            ChatMessage(role="user", content=evidence_range),
+        ]
+        messages.append(ChatMessage(role="developer", content=skill_prompt))
         text = self.chat_client.chat(
             model=self.models.main,
-            messages=[
-                ChatMessage(role="system", content=MEMORY_CATALOGER_PROMPT),
-                ChatMessage(role="user", content=json.dumps(payload, indent=2)),
-            ],
+            messages=messages,
         )
         return parse_json_object(text)
 
@@ -196,10 +225,10 @@ class MemoryOrchestrator:
         for fragment in fragments:
             prompt_text = "\n\n".join(
                 [
-                    "NEW MEMORIES",
-                    new_memories_text,
                     f"EXISTING MEMORIES ({fragment.fragment_id})",
                     self._format_existing_memories(fragment.mem_ids),
+                    "NEW MEMORIES",
+                    new_memories_text,
                 ]
             )
             text = self.chat_client.chat(
@@ -262,17 +291,28 @@ class MemoryOrchestrator:
         )
         return parse_json_object(text)
 
-    def _check_relevance(self, *, mem_ids: list[str], user_message: str, conversation_context: str) -> dict:
-        payload = {
-            "user_message": user_message,
-            "conversation_context": conversation_context,
-            "memory_items": [self._memory_snippet(mem_id) for mem_id in mem_ids],
-        }
+    def _check_relevance(
+        self,
+        *,
+        mem_ids: list[str],
+        user_message: str,
+        conversation_context: str,
+        fragment_id: str | None = None,
+    ) -> dict:
+        prompt_text = "\n\n".join(
+            [
+                f"EXISTING MEMORIES ({fragment_id or 'ad_hoc_group'})",
+                self._format_existing_memories(mem_ids),
+                "CURRENT REQUEST",
+                f"user_message: {user_message}",
+                f"conversation_context: {conversation_context}",
+            ]
+        )
         text = self.chat_client.chat(
             model=self.models.worker,
             messages=[
                 ChatMessage(role="system", content=MEMORY_FRAGMENT_AGENT_PROMPT),
-                ChatMessage(role="user", content=json.dumps(payload, indent=2)),
+                ChatMessage(role="user", content=prompt_text),
             ],
         )
         return parse_json_object(text)
@@ -339,7 +379,6 @@ class MemoryOrchestrator:
                     [
                         f"new_memory_index: {index}",
                         f"text: {candidate.text}",
-                        f"facets: {self._format_facets(candidate.facets)}",
                     ]
                 )
             )
@@ -357,7 +396,6 @@ class MemoryOrchestrator:
                     for part in [
                         f"mem_id: {item.mem_id}",
                         f"text: {item.text}",
-                        f"facets: {self._format_facets(item.facets)}",
                         self._format_links(item.mem_id),
                     ]
                     if part.strip()
@@ -409,7 +447,6 @@ class MemoryOrchestrator:
                         f"mem_id: {item.mem_id}",
                         f"proposed_connections: {proposed_connections or 'none'}",
                         f"text: {item.text}",
-                        f"facets: {self._format_facets(item.facets)}",
                         self._format_links(item.mem_id),
                     ]
                     if part.strip()

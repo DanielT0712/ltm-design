@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import sqlite3
 from collections.abc import Iterable
@@ -113,6 +112,11 @@ class MemoryStore:
               PRIMARY KEY (mem_id, model),
               FOREIGN KEY (mem_id) REFERENCES memory_items(mem_id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS id_counters (
+              name TEXT PRIMARY KEY,
+              next_value INTEGER NOT NULL
+            );
             """
         )
         self._conn.commit()
@@ -158,7 +162,19 @@ class MemoryStore:
         now: datetime | None = None,
     ) -> str:
         now = now or utc_now()
-        candidate_id = "cand_" + self._candidate_digest(candidate)
+        facets_json = json.dumps(candidate.facets.to_dict(), sort_keys=True)
+        evidence_json = json.dumps([ref.to_dict() for ref in candidate.evidence], sort_keys=True)
+        existing = self._conn.execute(
+            """
+            SELECT candidate_id FROM pending_memory_candidates
+            WHERE text = ? AND facets_json = ? AND evidence_json = ?
+            ORDER BY created_at LIMIT 1
+            """,
+            (candidate.text, facets_json, evidence_json),
+        ).fetchone()
+        if existing:
+            return existing["candidate_id"]
+        candidate_id = self._next_id("c")
         with self._conn:
             self._conn.execute(
                 """
@@ -170,8 +186,8 @@ class MemoryStore:
                     candidate_id,
                     candidate.title or self._title_for(candidate.text),
                     candidate.text,
-                    json.dumps(candidate.facets.to_dict(), sort_keys=True),
-                    json.dumps([ref.to_dict() for ref in candidate.evidence], sort_keys=True),
+                    facets_json,
+                    evidence_json,
                     CandidateStatus.PROPOSED.value,
                     trigger,
                     datetime_to_str(now),
@@ -211,16 +227,25 @@ class MemoryStore:
 
     def remember(self, candidate: MemoryCandidate, *, now: datetime | None = None) -> MemoryItem:
         now = now or utc_now()
-        mem_id = self._mem_id(candidate)
-        existing = self.get(mem_id)
-        if existing:
-            return existing
-
         title = candidate.title or self._title_for(candidate.text)
         semantic_text = self._semantic_text(candidate)
         lexical_text = self._lexical_text(title, candidate)
         evidence_json = json.dumps([ref.to_dict() for ref in candidate.evidence], sort_keys=True)
         facets_json = json.dumps(candidate.facets.to_dict(), sort_keys=True)
+        existing_row = self._conn.execute(
+            """
+            SELECT mem_id FROM memory_items
+            WHERE text = ? AND facets_json = ? AND evidence_json = ?
+            ORDER BY created_at LIMIT 1
+            """,
+            (candidate.text, facets_json, evidence_json),
+        ).fetchone()
+        if existing_row:
+            existing = self.get(existing_row["mem_id"])
+            if existing is not None:
+                return existing
+
+        mem_id = self._next_id("m")
         created_at = datetime_to_str(now)
 
         with self._conn:
@@ -417,9 +442,15 @@ class MemoryStore:
             missing = [mem_id for mem_id, item in zip(mem_id_tuple, items, strict=True) if item is None]
             raise KeyError(f"unknown mem ids: {missing}")
         text = self._fragment_text([item for item in items if item is not None])
-        fragment_id = "frag_" + hashlib.sha256(
-            json.dumps({"kind": kind.value, "mem_ids": mem_id_tuple}, sort_keys=True).encode("utf-8")
-        ).hexdigest()[:24]
+        existing = self._conn.execute(
+            """
+            SELECT fragment_id FROM memory_fragments
+            WHERE kind = ? AND mem_ids_json = ?
+            ORDER BY created_at LIMIT 1
+            """,
+            (kind.value, json.dumps(list(mem_id_tuple))),
+        ).fetchone()
+        fragment_id = existing["fragment_id"] if existing else self._next_id("f")
         created_at = datetime_to_str(now)
         fragment = MemoryFragment(
             fragment_id=fragment_id,
@@ -484,7 +515,7 @@ class MemoryStore:
                 chosen = connected_ranked[0]
 
         if chosen is None and fitting_fragments:
-            chosen = max(fitting_fragments, key=lambda fragment: max_tokens - fragment.token_count_estimate)
+            chosen = min(fitting_fragments, key=lambda fragment: fragment.token_count_estimate)
 
         if chosen is None:
             return self.build_fragment(
@@ -495,12 +526,17 @@ class MemoryStore:
             )
 
         next_mem_ids = tuple(dict.fromkeys((*chosen.mem_ids, mem_id)))
+        self._delete_fragment(chosen.fragment_id)
         return self.build_fragment(
             kind=FragmentKind.RECALL,
             mem_ids=next_mem_ids,
             title=chosen.title,
             now=now,
         )
+
+    def _delete_fragment(self, fragment_id: str) -> None:
+        with self._conn:
+            self._conn.execute("DELETE FROM memory_fragments WHERE fragment_id = ?", (fragment_id,))
 
     def list_fragments(self, *, kind: FragmentKind | None = None) -> list[MemoryFragment]:
         return self._list_fragments(kind=kind)
@@ -519,9 +555,17 @@ class MemoryStore:
         for fragment in self._list_fragments(kind=kind):
             if wanted.intersection(fragment.mem_ids):
                 fragments.append(fragment)
-                if limit is not None and len(fragments) >= limit:
-                    break
-        return fragments
+        fragments = self._drop_shadowed_fragments(fragments)
+        return fragments[:limit] if limit is not None else fragments
+
+    def _drop_shadowed_fragments(self, fragments: list[MemoryFragment]) -> list[MemoryFragment]:
+        kept: list[MemoryFragment] = []
+        for fragment in sorted(fragments, key=lambda item: (item.updated_at, item.fragment_id), reverse=True):
+            mem_ids = set(fragment.mem_ids)
+            if any(mem_ids.issubset(set(existing.mem_ids)) for existing in kept):
+                continue
+            kept.append(fragment)
+        return list(reversed(kept))
 
     def _upsert_fts(self, mem_id: str, title: str, lexical_text: str, facets: Facets) -> None:
         self._conn.execute("DELETE FROM memory_items_fts WHERE mem_id = ?", (mem_id,))
@@ -551,19 +595,31 @@ class MemoryStore:
             reference_count=row["reference_count"],
         )
 
-    def _mem_id(self, candidate: MemoryCandidate) -> str:
-        return "mem_" + self._candidate_digest(candidate)
+    def _next_id(self, prefix: str) -> str:
+        with self._conn:
+            row = self._conn.execute(
+                "SELECT next_value FROM id_counters WHERE name = ?",
+                (prefix,),
+            ).fetchone()
+            value = row["next_value"] if row else 1
+            self._conn.execute(
+                """
+                INSERT INTO id_counters (name, next_value) VALUES (?, ?)
+                ON CONFLICT(name) DO UPDATE SET next_value = excluded.next_value
+                """,
+                (prefix, value + 1),
+            )
+        return f"{prefix}{self._base62_int(value)}"
 
-    def _candidate_digest(self, candidate: MemoryCandidate) -> str:
-        payload = json.dumps(
-            {
-                "text": candidate.text.strip(),
-                "facets": candidate.facets.to_dict(),
-                "evidence": [ref.to_dict() for ref in candidate.evidence],
-            },
-            sort_keys=True,
-        )
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+    def _base62_int(self, number: int) -> str:
+        alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+        if number == 0:
+            return alphabet[0]
+        chars: list[str] = []
+        while number:
+            number, rem = divmod(number, len(alphabet))
+            chars.append(alphabet[rem])
+        return "".join(reversed(chars))
 
     def _semantic_text(self, candidate: MemoryCandidate) -> str:
         return candidate.text.strip()
