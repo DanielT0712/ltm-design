@@ -26,7 +26,6 @@ class FakeChatClient:
                             "text": "The user wants same_as memories thrown away instead of written.",
                             "facets": {"people": [], "topics": ["memory deduplication"], "emotions": [], "events": [], "places": [], "objects": [], "times": []},
                             "references": [{"source_id": "thread_1", "message_id": "u_1", "event_id": None, "speaker": "user", "whole_source": True, "start_anchor": None, "end_anchor": None}],
-                            "connection_hints": [],
                         }
                     ],
                     "processed_through": "[src:thread_1 msg:u_1]",

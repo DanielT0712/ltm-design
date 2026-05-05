@@ -41,7 +41,6 @@ class ExtractedMemory:
     text: str
     facets: Facets = Facets()
     evidence: tuple[EvidenceRef, ...] = ()
-    connection_hints: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

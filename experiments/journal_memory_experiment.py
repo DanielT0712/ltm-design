@@ -230,7 +230,6 @@ class ExperimentDeterministicChatClient:
                             "whole_source": True,
                         }
                     ],
-                    "connection_hints": [],
                 }
             )
         processed = markers[-1].group(0) if markers else payload.get("processed_through", "")

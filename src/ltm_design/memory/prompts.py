@@ -120,8 +120,7 @@ Output JSON:
           "start_anchor": "exact source substring|null",
           "end_anchor": "exact source substring|null"
         }
-      ],
-      "connection_hints": ["string"]
+      ]
     }
   ],
   "processed_through": "pointer"
