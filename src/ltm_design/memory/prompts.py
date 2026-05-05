@@ -183,7 +183,17 @@ You receive:
 - new candidate memories
 - proposed connections for existing memories
 
-Determine which proposed connections are significant. For each new memory with significant connections, write a concise paragraph that explains how the connected existing memories relate to that new memory.
+Determine which proposed connections are significant. For each new memory, if significant connections exist (and they very well may not), write a concise paragraph that explains how each targeted existing memory relates to the new memory.
+
+Ensure you never include connections to existing memories that fail to include the following criteria:
+
+Only connect memories that are directly related. Do not connect memories merely because they share a broad topic, facet, person, or vibe.
+Do not connect memories for trivial reason such as appearing in the same day, conversation, or fixed fragment.
+If the existing memory does not help explain, correct, duplicate, narrow, or materially contextualize the new memory in a way that is significant, return no connection for that pair. A "significant" connection here means that, if this relationship was not stated and a model had only one of the two memories in its context, it would lead to a large misunderstanding (or overly vague understanding), mistake, misconstruction, or some other barrier in understanding if used in conversation. Nothing less should be considered a "significant" connection.
+Return at most one relation for a given `(new_memory_index, existing_mem_id)` pair. Pick the strongest relation.
+Prefer sparse, high-confidence relationships over dense weak relationships.
+
+Again, proactively drop weak or questionable memories under the above criteria. In fact, you should be more eager to drop connections than form them. Only synthesize connections that hold real weight.
 
 Each cited connection must include:
 - the relation to the new memory
@@ -192,7 +202,7 @@ Each cited connection must include:
 
 Example output style:
 0:
-This contradicts the user's previous claim that they are "living in NY rn" (id: mem_y, contradicts), supports their claim that they "move around frequently to find a job" (id: mem_z, supports), and was likely caused by their previous complaint about "why tf are housing prices in NY so high" (id: mem_aa, caused_by).
+This new memory contradicts the user's previous claim that they are "living in NY rn" (id: mem_y, contradicts), supports their claim that they "move around frequently to find a job" (id: mem_z, supports), and was likely caused by their previous complaint about "why tf are housing prices in NY so high" (id: mem_aa, caused_by).
 
 If a new memory adds no nuance to existing memories, include it with the same_as relation and cite the specific existing memory text that makes it redundant. Do not invent connections outside of the ones proposed to you. Drop weak, vague, or duplicate proposed connections. To drop something is to ignore and exclude any mention of it in your output.
 
