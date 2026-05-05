@@ -43,7 +43,7 @@ Temporary experiment instruction for the main conversation model:
 Treat each journal entry as if the user has just shared it in a conversation. For this test only,
 call the memory-cataloging agent after each journal entry so durable, future-useful details can
 be stored. For experiment observability, respond with JSON:
-{"call_memory_storage": true, "processed_through": "the last source marker already processed before this call"}
+{"call_memory_storage": true}
 """
 
 
@@ -70,7 +70,7 @@ class JournalEntry:
 
     @property
     def source_marker(self) -> str:
-        return f"[src:{self.source_id} msg:{self.message_id}]"
+        return f"source_marker: [{self.source_id}]"
 
 
 class LinkParser(HTMLParser):
@@ -124,7 +124,24 @@ class ArticleTextParser(HTMLParser):
         value = html.unescape("".join(self.parts))
         value = re.sub(r"[ \t\r\f\v]+", " ", value)
         value = re.sub(r"\n{3,}", "\n\n", value)
-        return value.strip()
+        return clean_journal_text(value)
+
+
+def clean_journal_text(value: str) -> str:
+    value = html.unescape(value)
+    value = re.sub(r"[ \t\r\f\v]+", " ", value)
+    value = re.sub(r"\n{3,}", "\n\n", value).strip()
+    lines = [line.strip() for line in value.splitlines()]
+    while lines and not lines[0]:
+        lines.pop(0)
+    if lines and re.fullmatch(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}", lines[0]):
+        lines.pop(0)
+    body: list[str] = []
+    for line in lines:
+        if re.fullmatch(r"— \d{4}-\d{2}-\d{2} \d{2}:\d{2}", line):
+            break
+        body.append(line)
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(body)).strip()
 
 
 class HashEmbeddingProvider:
@@ -154,11 +171,10 @@ class ExperimentDeterministicChatClient:
         if "memory cataloger" in prompt_text:
             payload = {
                 "evidence_range": "\n\n".join(message.content for message in messages if message.role == "user"),
-                "processed_through": self._field_from_skill_prompt(prompt_text, "processed_through"),
             }
             return json.dumps(self._catalog(payload))
         if "Memory trigger policy for the live conversation model" in prompt_text:
-            return json.dumps({"call_memory_storage": True, "processed_through": ""})
+            return json.dumps({"call_memory_storage": True})
         if "memory connection checker" in prompt_text:
             return json.dumps({"connections": []})
         if "memory connection summarizer" in prompt_text:
@@ -194,14 +210,14 @@ class ExperimentDeterministicChatClient:
 
     def _catalog(self, payload: dict) -> dict:
         evidence_range = payload["evidence_range"]
-        markers = list(re.finditer(r"^\[src:([^\] ]+) msg:([^\]]+)\]$", evidence_range, flags=re.M))
+        markers = list(re.finditer(r"^source_marker: \[([A-Za-z0-9]+)\]$", evidence_range, flags=re.M))
         memories = []
         for index, marker in enumerate(markers):
             start = marker.end()
             end = markers[index + 1].start() if index + 1 < len(markers) else len(evidence_range)
             block = evidence_range[start:end].strip()
             date_match = re.search(r"User journal entry dated ([^.]+)\.", block)
-            title = date_match.group(1) if date_match else marker.group(2)
+            title = date_match.group(1) if date_match else marker.group(1)
             body = block[date_match.end():].strip() if date_match else block
             body = re.sub(r"\s+", " ", body).strip()
             if not body:
@@ -211,6 +227,7 @@ class ExperimentDeterministicChatClient:
                 excerpt += "..."
             memories.append(
                 {
+                    "new_memory_index": len(memories),
                     "text": f"The journal entry for {title} says: {excerpt}",
                     "facets": {
                         "people": [],
@@ -223,17 +240,15 @@ class ExperimentDeterministicChatClient:
                     },
                     "references": [
                         {
-                            "source_id": marker.group(1),
-                            "message_id": marker.group(2),
-                            "event_id": None,
+                            "source_marker": f"[{marker.group(1)}]",
                             "speaker": "user",
-                            "whole_source": True,
+                            "start_anchor": body[:80],
+                            "end_anchor": body[-80:],
                         }
                     ],
                 }
             )
-        processed = markers[-1].group(0) if markers else payload.get("processed_through", "")
-        return {"memories": memories, "processed_through": processed}
+        return {"memories": memories}
 
 
 class RecordingChatClient:
@@ -355,10 +370,9 @@ def parse_entry(url: str) -> JournalEntry:
         published = datetime.fromisoformat(stamp).replace(tzinfo=timezone.utc).isoformat()
     except ValueError:
         published = datetime.now(timezone.utc).isoformat()
-    slug = raw_slug.replace(":", "-")
     return JournalEntry(
-        source_id=f"journal_derik_{slug}",
-        message_id=f"u_{slug}",
+        source_id=raw_slug,
+        message_id=raw_slug,
         title=title,
         url=url,
         published_at=published,
@@ -386,13 +400,24 @@ def scrape(workers: int) -> list[JournalEntry]:
             for path in paths:
                 entry_paths[path] = None
 
-    entry_urls = [urllib.parse.urljoin(BASE_URL, path) for path in entry_paths]
+    entry_urls = sorted(urllib.parse.urljoin(BASE_URL, path) for path in entry_paths)
     print(f"discovered {len(entry_urls)} entries")
     entries: list[JournalEntry] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        for entry in pool.map(parse_entry, entry_urls):
+        for index, entry in enumerate(pool.map(parse_entry, entry_urls), start=1):
             if entry.text:
-                entries.append(entry)
+                compact_id = f"s{index}"
+                entries.append(
+                    JournalEntry(
+                        source_id=compact_id,
+                        message_id=compact_id,
+                        title=entry.title,
+                        url=entry.url,
+                        published_at=entry.published_at,
+                        text=entry.text,
+                        html_path=entry.html_path,
+                    )
+                )
                 print(f"cached entry {entry.title}")
 
     entries.sort(key=lambda item: item.published_at)
@@ -407,9 +432,21 @@ def load_entries() -> list[JournalEntry]:
     if not ENTRIES_JSONL.exists():
         raise SystemExit(f"{ENTRIES_JSONL} does not exist; run scrape first")
     entries = []
-    for line in ENTRIES_JSONL.read_text(encoding="utf-8").splitlines():
+    for index, line in enumerate(ENTRIES_JSONL.read_text(encoding="utf-8").splitlines(), start=1):
         if line.strip():
-            entries.append(JournalEntry(**json.loads(line)))
+            entry = JournalEntry(**json.loads(line))
+            compact_id = f"s{index}"
+            entries.append(
+                JournalEntry(
+                    source_id=compact_id,
+                    message_id=compact_id,
+                    title=entry.title,
+                    url=entry.url,
+                    published_at=entry.published_at,
+                    text=clean_journal_text(entry.text),
+                    html_path=entry.html_path,
+                )
+            )
     return entries
 
 
@@ -461,8 +498,11 @@ def add_evidence(store: MemoryStore, entry: JournalEntry) -> None:
 
 def load_state() -> dict:
     if RUN_STATE_JSON.exists():
-        return json.loads(RUN_STATE_JSON.read_text(encoding="utf-8"))
-    return {"processed_through": "", "completed_source_ids": []}
+        state = json.loads(RUN_STATE_JSON.read_text(encoding="utf-8"))
+        if "completed_source_ids" not in state:
+            state["completed_source_ids"] = []
+        return state
+    return {"completed_source_ids": []}
 
 
 def save_state(state: dict) -> None:
@@ -491,8 +531,7 @@ def run_memory(batch_size: int, max_entries: int | None, chat: str, main_model: 
         chat_client=chat_client,
         models=MemoryModels(main=main_model, worker=worker_model),
     )
-    processed_through = state.get("processed_through", "")
-    main_messages: list[ChatMessage] = [
+    committed_messages: list[ChatMessage] = [
         ChatMessage(
             role="system",
             content="\n\n".join([MAIN_CONVERSATION_MEMORY_TRIGGER_PROMPT, EXPERIMENT_INSTRUCTION]),
@@ -500,20 +539,21 @@ def run_memory(batch_size: int, max_entries: int | None, chat: str, main_model: 
     ]
     for entry in entries:
         if entry.source_id in completed:
-            main_messages.append(main_user_message_for(entry))
+            committed_messages.append(main_user_message_for(entry))
 
     for start in range(0, len(pending), batch_size):
         batch = pending[start:start + batch_size]
         for entry in batch:
             add_evidence(store, entry)
         print(f"processing {batch[0].title} .. {batch[-1].title} ({len(batch)} entries)", flush=True)
-        for entry in batch:
-            main_messages.append(main_user_message_for(entry))
+        uncommitted_messages = [main_user_message_for(entry) for entry in batch]
+        main_messages = [*committed_messages, *uncommitted_messages]
         chat_client.set_context(
             entry_titles=[entry.title for entry in batch],
             entry_source_ids=[entry.source_id for entry in batch],
             conversation_entries=sum(1 for message in main_messages if message.role == "user"),
-            processed_through_before=processed_through,
+            committed_source_ids=sorted(completed),
+            uncommitted_source_ids=[entry.source_id for entry in batch],
         )
         trigger_text = chat_client.chat(
             model=main_model,
@@ -524,21 +564,21 @@ def run_memory(batch_size: int, max_entries: int | None, chat: str, main_model: 
             print("main model did not call memory storage; skipping storage branch", flush=True)
             continue
         result = orchestrator.process_memory_skill(
-            processed_through=trigger.get("processed_through") or processed_through,
             evidence_range="",
             recent_context="",
-            conversation_messages=list(main_messages),
+            conversation_messages=list(committed_messages),
+            uncommitted_messages=uncommitted_messages,
         )
-        processed_through = batch[-1].source_marker
         completed.update(entry.source_id for entry in batch)
+        committed_messages.extend(uncommitted_messages)
         state = {
-            "processed_through": processed_through,
             "completed_source_ids": sorted(completed),
+            "committed_boundary": batch[-1].source_marker,
             "last_approved_mem_ids": list(result.approved_mem_ids),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         save_state(state)
-        print(f"approved {len(result.approved_mem_ids)} memories; processed_through={processed_through}", flush=True)
+        print(f"approved {len(result.approved_mem_ids)} memories; committed_boundary={batch[-1].source_marker}", flush=True)
 
 
 def stats() -> None:
@@ -552,7 +592,7 @@ def stats() -> None:
     if RUN_STATE_JSON.exists():
         state = json.loads(RUN_STATE_JSON.read_text(encoding="utf-8"))
         print(f"processed entries: {len(state.get('completed_source_ids', []))}")
-        print(f"processed_through: {state.get('processed_through', '')}")
+        print(f"committed_boundary: {state.get('committed_boundary', '')}")
     if MODEL_IO_JSONL.exists():
         calls = [json.loads(line) for line in MODEL_IO_JSONL.read_text(encoding="utf-8").splitlines() if line.strip()]
         print(f"model calls: {len(calls)}")
@@ -696,7 +736,7 @@ function renderSummary() {{
   ];
   $("summary").innerHTML = stats.map(([k,v]) => `<div class="stat"><b>${{v}}</b><span class="muted">${{k}}</span></div>`).join("")
     + `<div class="stat"><b>${{Object.entries(roleCounts).map(([k,v]) => `${{k}}:${{v}}`).join(" ") || "none"}}</b><span class="muted">call roles</span></div>`;
-  $("state").textContent = DATA.state.processed_through || "no processed pointer";
+  $("state").textContent = DATA.state.committed_boundary || "no committed boundary";
 }}
 function groupBranches() {{
   const groups = [];

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Protocol
@@ -10,6 +11,7 @@ from ltm_design.memory.embeddings import EmbeddingProvider
 from ltm_design.memory.models import EvidenceRef, Facets, MemoryCandidate, MemoryLink, MemoryRelation
 from ltm_design.memory.models import FragmentKind
 from ltm_design.memory.prompts import (
+    ANCHOR_DISAMBIGUATION_PROMPT,
     MAIN_MEMORY_DECISION_PROMPT,
     MEMORY_CATALOGER_PROMPT,
     MEMORY_FRAGMENT_AGENT_PROMPT,
@@ -66,16 +68,25 @@ class MemoryOrchestrator:
     def process_memory_skill(
         self,
         *,
-        processed_through: str,
         evidence_range: str,
         recent_context: str = "",
         conversation_messages: list[ChatMessage] | None = None,
+        uncommitted_messages: list[ChatMessage] | None = None,
     ) -> MemorySkillResult:
         catalog = self._catalog_memories(
-            processed_through=processed_through,
             evidence_range=evidence_range,
             recent_context=recent_context,
             conversation_messages=conversation_messages,
+            uncommitted_messages=uncommitted_messages,
+        )
+        uncommitted_source_texts = self._source_texts_by_marker(uncommitted_messages or [])
+        catalog = self._filter_catalog_to_uncommitted_sources(
+            catalog,
+            uncommitted_source_texts,
+        )
+        catalog = self._repair_ambiguous_anchors(
+            catalog,
+            uncommitted_source_texts,
         )
         candidates = self._candidates_from_catalog(catalog)
         candidate_ids = [
@@ -174,27 +185,135 @@ class MemoryOrchestrator:
     def _catalog_memories(
         self,
         *,
-        processed_through: str,
         evidence_range: str,
         recent_context: str,
         conversation_messages: list[ChatMessage] | None = None,
+        uncommitted_messages: list[ChatMessage] | None = None,
     ) -> dict:
+        catalog_prompt = self._catalog_prompt(uncommitted_messages or [])
         skill_prompt = "\n\n".join(
             [
                 "MEMORY CATALOGER SKILL PROMPT",
-                MEMORY_CATALOGER_PROMPT,
-                f"processed_through: {processed_through}",
+                catalog_prompt,
             ]
         )
         messages = list(conversation_messages) if conversation_messages is not None else [
             ChatMessage(role="user", content=evidence_range),
         ]
         messages.append(ChatMessage(role="developer", content=skill_prompt))
+        if uncommitted_messages:
+            messages.extend(uncommitted_messages)
         text = self.chat_client.chat(
             model=self.models.main,
             messages=messages,
         )
         return parse_json_object(text)
+
+    def _filter_catalog_to_uncommitted_sources(
+        self,
+        catalog: dict,
+        source_texts: dict[str, str],
+    ) -> dict:
+        if not source_texts:
+            return catalog
+        memories: list[dict] = []
+        for item in catalog.get("memories", []):
+            references = [
+                ref
+                for ref in item.get("references", [])
+                if self._reference_matches_uncommitted_source(ref, source_texts)
+            ]
+            if not references:
+                continue
+            item = dict(item)
+            item["references"] = references
+            memories.append(item)
+        catalog = dict(catalog)
+        catalog["memories"] = memories
+        return catalog
+
+    def _reference_matches_uncommitted_source(self, ref: dict, source_texts: dict[str, str]) -> bool:
+        source_text = source_texts.get(self._reference_source_id(ref))
+        if not source_text:
+            return False
+        start_anchor = ref.get("start_anchor")
+        end_anchor = ref.get("end_anchor")
+        if not isinstance(start_anchor, str) or not isinstance(end_anchor, str):
+            return False
+        if not start_anchor or not end_anchor:
+            return False
+        start = source_text.find(start_anchor)
+        if start == -1:
+            return False
+        return source_text.find(end_anchor, start) != -1
+
+    def _repair_ambiguous_anchors(
+        self,
+        catalog: dict,
+        source_texts: dict[str, str],
+    ) -> dict:
+        tasks: list[dict] = []
+        for memory_position, item in enumerate(catalog.get("memories", [])):
+            memory_index = int(item.get("new_memory_index", memory_position))
+            for reference_index, ref in enumerate(item.get("references", [])):
+                source_id = self._reference_source_id(ref)
+                source_text = source_texts.get(source_id)
+                if not source_text:
+                    continue
+                ref["source_marker"] = f"[{source_id}]"
+                for anchor_name in ("start_anchor", "end_anchor"):
+                    anchor = ref.get(anchor_name)
+                    if not isinstance(anchor, str) or not anchor:
+                        continue
+                    occurrences = [match.span() for match in re.finditer(re.escape(anchor), source_text)]
+                    if len(occurrences) <= 1:
+                        continue
+                    options = self._unique_anchor_options(source_text, occurrences)
+                    if len(options) > 1:
+                        tasks.append(
+                            {
+                                "new_memory_index": memory_index,
+                                "reference_index": reference_index,
+                                "anchor": anchor_name,
+                                "options": options,
+                            }
+                        )
+        if not tasks:
+            return catalog
+
+        prompt = self._format_anchor_disambiguation_tasks(tasks)
+        text = self.chat_client.chat(
+            model=self.models.main,
+            messages=[
+                ChatMessage(role="system", content=ANCHOR_DISAMBIGUATION_PROMPT),
+                ChatMessage(role="user", content=prompt),
+            ],
+        )
+        choices = parse_json_object(text).get("choices", [])
+        memories = catalog.get("memories", [])
+        by_key = {
+            (task["new_memory_index"], task["reference_index"], task["anchor"]): task
+            for task in tasks
+        }
+        memory_by_index = {
+            int(item.get("new_memory_index", position)): item
+            for position, item in enumerate(memories)
+        }
+        for choice in choices:
+            key = (
+                int(choice.get("new_memory_index", -1)),
+                int(choice.get("reference_index", -1)),
+                choice.get("anchor"),
+            )
+            task = by_key.get(key)
+            memory = memory_by_index.get(key[0])
+            if task is None or memory is None:
+                continue
+            selected = int(choice.get("choice", 0))
+            if selected < 1 or selected > len(task["options"]):
+                continue
+            memory["references"][key[1]][key[2]] = task["options"][selected - 1]
+        return catalog
 
     def _discover_connections(self, candidates: list[MemoryCandidate]) -> str:
         if not candidates:
@@ -345,8 +464,12 @@ class MemoryOrchestrator:
         for item in catalog.get("memories", []):
             evidence = tuple(
                 EvidenceRef(
-                    source_id=ref["source_id"],
-                    locator={key: value for key, value in ref.items() if key != "source_id"},
+                    source_id=self._reference_source_id(ref),
+                    locator={
+                        key: value
+                        for key, value in ref.items()
+                        if key not in {"source_id", "source_marker"}
+                    },
                 )
                 for ref in item.get("references", [])
             )
@@ -459,3 +582,119 @@ class MemoryOrchestrator:
 
     def _link_new_index(self, link: dict) -> int:
         return link.get("from_new_memory_index", link.get("new_memory_index", -1))
+
+    def _source_texts_by_marker(self, messages: list[ChatMessage]) -> dict[str, str]:
+        texts: dict[str, str] = {}
+        marker_pattern = re.compile(r"^source_marker:\s*\[([A-Za-z0-9]+)\]\s*$", re.MULTILINE)
+        for message in messages:
+            matches = list(marker_pattern.finditer(message.content))
+            for index, match in enumerate(matches):
+                start = match.end()
+                end = matches[index + 1].start() if index + 1 < len(matches) else len(message.content)
+                texts[match.group(1)] = message.content[start:end].strip()
+        return texts
+
+    def _normalize_source_id(self, value: str) -> str:
+        match = re.search(r"\[([A-Za-z0-9]+)\]", value)
+        return match.group(1) if match else value
+
+    def _reference_source_id(self, ref: dict) -> str:
+        return self._normalize_source_id(str(ref.get("source_marker") or ref.get("source_id") or ""))
+
+    def _catalog_start_marker_instruction(self, uncommitted_messages: list[ChatMessage]) -> str:
+        source_texts = self._source_texts_by_marker(uncommitted_messages)
+        if not source_texts:
+            return ""
+        start_source_id = next(iter(source_texts))
+        excerpt = self._first_two_sentences(self._source_body_text(source_texts[start_source_id]))
+        parts = [
+            f"The starting source marker is [{start_source_id}]. Never create memories with a source marker earlier "
+            f"than this. If a memory you were planning to include has a source marker smaller than [{start_source_id}], "
+            "be absolutely certain you do not include it. It is important that you ensure all the memories you create "
+            f"have source markers greater than or equal to [{start_source_id}].",
+        ]
+        if excerpt:
+            parts.append(
+                f'The text you should process starts here: "{excerpt}" '
+                "Do not commit anything before this starting text to memory; earlier conversation is context only "
+                "and must not become a new memory. This is a common mistake and you should take great care in preventing it."
+            )
+        return " ".join(parts)
+
+    def _catalog_prompt(self, uncommitted_messages: list[ChatMessage]) -> str:
+        instruction = self._catalog_start_marker_instruction(uncommitted_messages)
+        if not instruction:
+            return MEMORY_CATALOGER_PROMPT
+        return MEMORY_CATALOGER_PROMPT.replace(
+            "\nOutput JSON:",
+            f"\n{instruction}\n\nOutput JSON:",
+            1,
+        )
+
+    def _source_body_text(self, source_text: str) -> str:
+        lines = source_text.strip().splitlines()
+        if lines and re.fullmatch(r"User journal entry dated .+\.", lines[0].strip()):
+            lines = lines[1:]
+        return "\n".join(lines).strip()
+
+    def _first_two_sentences(self, text: str) -> str:
+        collapsed = re.sub(r"\s+", " ", text).strip()
+        if not collapsed:
+            return ""
+        matches = list(re.finditer(r"(?<=[.!?])\s+", collapsed))
+        if len(matches) >= 2:
+            return collapsed[:matches[1].start()].strip()
+        return collapsed
+
+    def _format_anchor_disambiguation_tasks(self, tasks: list[dict]) -> str:
+        sections: list[str] = []
+        for task in tasks:
+            options = "\n".join(
+                f"{index}. \"{option}\""
+                for index, option in enumerate(task["options"], start=1)
+            )
+            sections.append(
+                "\n".join(
+                    [
+                        f"Your {task['anchor']} for memory number {task['new_memory_index']} was not unique.",
+                        f"reference_index: {task['reference_index']}",
+                        "Did you mean:",
+                        options,
+                        "Select the correct anchor for your memory by its number.",
+                    ]
+                )
+            )
+        return "\n\n".join(sections)
+
+    def _unique_anchor_options(self, text: str, occurrences: list[tuple[int, int]]) -> list[str]:
+        token_spans = [(match.start(), match.end()) for match in re.finditer(r"\S+", text)]
+        options = [text[start:end] for start, end in occurrences]
+        radius = 0
+        while len(set(options)) < len(options) and radius < 16:
+            radius += 1
+            options = [
+                self._expanded_anchor_text(text, token_spans, occurrence, radius)
+                for occurrence in occurrences
+            ]
+        return options
+
+    def _expanded_anchor_text(
+        self,
+        text: str,
+        token_spans: list[tuple[int, int]],
+        occurrence: tuple[int, int],
+        radius: int,
+    ) -> str:
+        start, end = occurrence
+        covered = [
+            index
+            for index, (token_start, token_end) in enumerate(token_spans)
+            if token_start < end and token_end > start
+        ]
+        if not covered:
+            return text[start:end]
+        first = max(0, covered[0] - radius)
+        last = min(len(token_spans) - 1, covered[-1] + radius)
+        expanded_start = token_spans[first][0]
+        expanded_end = token_spans[last][1]
+        return text[expanded_start:expanded_end]

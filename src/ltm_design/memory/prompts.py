@@ -13,15 +13,12 @@ Trigger the skill when:
 
 Do not trigger the skill without some pressing reason to process memory immediately.
 
-When triggering the skill, provide:
-- processed_through: the last source marker already processed into memory
+When triggering the skill, call the memory-cataloging skill. The storage runner will provide the correct unprocessed conversation entries to that skill.
 """
 
 
 MEMORY_CATALOGER_PROMPT = """\
 You are now a memory cataloger for a long-term memory system, working on the conversation transcript that you have already seen.
-
-You will receive a `processed_through` pointer marking what has already been processed into memory. The conversation you have already seen is indexed: each user prompt and other source event is prefixed with a stable source marker such as `[src:thread_7 msg:u_0042]`. Start immediately after `processed_through` and inspect only later indexed conversation entries. Your job is to assemble everything worth remembering, not to identify only one "main" memory.
 
 Memories should be concise standalone text items which quote original user input as accurately as possible, acting as a concise, organized wrapper for the user's input or your observations of the user.
 
@@ -44,11 +41,13 @@ Do not create memories for:
 - one-off task mechanics with no future value
 - weak guesses about emotion or intent
 
-Use direct wording when the user stated something. Attach relevant facets for labeling. Leave irrelevant facet lists blank. Attach references pointing to source records.
+Use direct wording when the user stated something. Attach relevant facets for labeling. Leave irrelevant facet lists blank. Attach references pointing to source records. Number every memory with `new_memory_index`, starting at 0 and increasing by 1, so later connection and repair steps can refer to the same memory.
 
 You should make proactive observations on the user's tone, habits or other implicit factors in their input where you feel it is obvious and significant to how you interact with the user or how you expect the user to act. However, you should use cautious wording when doing so, refraining from treating inferences as fact.
 
 For model-behavior expectations, do not store the generic factual details themselves when they are searchable. Store the user's expectation. For example: store that the user expects the model to know DeepSeek v4 exists, or expects the model not to hallucinate about a topic and to cite a specific source.
+
+You do not have to, nor should you, chronicle every single event, fact or thought the user brings up in their conversation. A good rule of thumb is, would a normal person who was told this remember it the next morning? If not, it's likely insignificant filler or small talk.
 
 After this cataloging step, you will receive connection/redundancy information for each memory. You will then help decide which memories should be stored and which connections are worth keeping.
 
@@ -80,26 +79,29 @@ Facet categories:
 
 References:
 - Every memory must have at least one evidence reference.
-- Use the stable source marker from the transcript entry that supports the memory.
+- The conversation is indexed: each user prompt and other event is prefixed with a short source marker line such as `source_marker: [s42]`. Use the source marker (so in this case [s42]) from the conversation entry that supports the memory.
 - For each reference, provide exact starting and ending words copied from the source text. These anchors must be character-exact substrings of the source entry, including punctuation and capitalization.
 - `start_anchor` should be the shortest distinctive exact excerpt (no grammar or meaning required, don't prioritize splitting at natural language boundaries, just split when distinct) near where the relevant evidence begins, usually 2-6 words.
 - `end_anchor` should be the shortest distinctive exact excerpt near where the relevant evidence ends, usually 2-6 words.
-- If the memory is supported by a whole prompt or source entry, set `whole_source` to true and omit `start_anchor` and `end_anchor`.
 - Do not paraphrase anchors. Do not use summaries as anchors.
 - Reference the user's original input when the memory is based on a user statement.
 - Reference assistant/system/tool context only when the memory depends on it.
 
-Pointer format:
-- `processed_through` is the last fully processed source marker, e.g. `[src:thread_7 msg:u_0041]`.
-- Process only transcript entries after that marker.
-- Return `processed_through` as the final source marker you inspected, even if you produce no memories.
-
-The storage runner will convert exact anchors into character offsets before storage. If there are multiple possible matches, choose longer or more distinctive anchors. If an anchor cannot be exact, omit that memory rather than inventing a reference.
+You should only extract memories from the conversation that is given to you after this prompt. Earlier conversation is context only; do not create memories from them. Your job is to assemble everything worth remembering from the new entries, not to identify only one "main" memory.
 
 Output JSON:
 {
   "memories": [
     {
+      "new_memory_index": 0,
+      "references": [
+        {
+          "source_marker": "[s0]",
+          "speaker": "user|assistant|system|tool|unknown",
+          "start_anchor": "exact source substring|null",
+          "end_anchor": "exact source substring|null"
+        }
+      ],
       "text": "standalone memory text",
       "facets": {
         "people": ["string"],
@@ -109,21 +111,28 @@ Output JSON:
         "places": ["string"],
         "objects": ["string"],
         "times": ["string"]
-      },
-      "references": [
-        {
-          "source_id": "string",
-          "message_id": "string|null",
-          "event_id": "string|null",
-          "speaker": "user|assistant|system|tool|unknown",
-          "whole_source": false,
-          "start_anchor": "exact source substring|null",
-          "end_anchor": "exact source substring|null"
-        }
-      ]
+      }
     }
-  ],
-  "processed_through": "pointer"
+  ]
+}
+"""
+
+
+ANCHOR_DISAMBIGUATION_PROMPT = """\
+You are repairing source anchors for cataloged memories.
+
+Some anchors were not unique in the referenced source text. For each item, choose the numbered option that points to the evidence span intended by the memory. Use only the provided option numbers.
+
+Output JSON:
+{
+  "choices": [
+    {
+      "new_memory_index": 0,
+      "reference_index": 0,
+      "anchor": "start_anchor|end_anchor",
+      "choice": 1
+    }
+  ]
 }
 """
 
