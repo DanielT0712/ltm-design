@@ -39,9 +39,11 @@ class FakeChatClient:
             existing_mem_id = re.search(r"^mem_id: ([^\n]+)", messages[1].content, re.MULTILINE).group(1)
             return json.dumps({"connections": [{"new_memory_index": 0, "existing_mem_id": existing_mem_id, "relation": "same_as"}]})
         if "memory connection summarizer" in prompt_text:
-            existing_mem_id = re.search(r"^mem_id: ([^\n]+)", messages[1].content, re.MULTILINE).group(1)
+            existing_mem_id = re.search(r"^[- ]*existing_mem_id: ([^\n]+)", messages[1].content, re.MULTILINE).group(1)
             assert "CONNECTED EXISTING MEMORIES" not in messages[1].content
-            assert "proposed_connections: new_memory_index 0: same_as" in messages[1].content
+            assert "PROPOSED CONNECTIONS BY NEW MEMORY" in messages[1].content
+            assert "new_memory_index: 0" in messages[1].content
+            assert "relation: same_as" in messages[1].content
             return f"0:\nThis is redundant with the existing memory that the user wants \"same_as memories thrown away instead of written\" (id: {existing_mem_id}, same_as)."
         if "continuing the memory cataloging task" in prompt_text:
             assert re.match(

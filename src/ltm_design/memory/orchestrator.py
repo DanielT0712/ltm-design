@@ -368,7 +368,7 @@ class MemoryOrchestrator:
             if connection.get("existing_mem_id")
         }
         return self._summarize_storage_connections(
-            new_memories_text=new_memories_text,
+            candidates=candidates,
             fragment_outputs=fragment_outputs,
             connected_ids=connected_ids,
         )
@@ -376,18 +376,19 @@ class MemoryOrchestrator:
     def _summarize_storage_connections(
         self,
         *,
-        new_memories_text: str,
+        candidates: list[MemoryCandidate],
         fragment_outputs: list[dict],
         connected_ids: set[str],
     ) -> str:
         if not connected_ids:
             return ""
+        proposed_connections = self._format_proposed_connections_by_new_memory(candidates, fragment_outputs)
+        if proposed_connections == "none":
+            return ""
         prompt_text = "\n\n".join(
             [
-                "NEW MEMORIES",
-                new_memories_text,
-                "PROPOSED CONNECTIONS",
-                self._format_proposed_connection_memories(fragment_outputs, connected_ids),
+                "PROPOSED CONNECTIONS BY NEW MEMORY",
+                proposed_connections,
             ]
         )
         text = self.chat_client.chat(
@@ -575,6 +576,58 @@ class MemoryOrchestrator:
                     if part.strip()
                 )
             )
+        return "\n\n".join(sections) if sections else "none"
+
+    def _format_proposed_connections_by_new_memory(
+        self,
+        candidates: list[MemoryCandidate],
+        fragment_outputs: list[dict],
+    ) -> str:
+        by_new_index: dict[int, list[dict]] = {}
+        for output in fragment_outputs:
+            for connection in output.get("connections", []):
+                index = connection.get("new_memory_index")
+                mem_id = connection.get("existing_mem_id")
+                relation = connection.get("relation")
+                if not isinstance(index, int) or index < 0 or index >= len(candidates):
+                    continue
+                if not mem_id or not relation:
+                    continue
+                by_new_index.setdefault(index, []).append(connection)
+
+        sections: list[str] = []
+        emitted_existing_text: set[str] = set()
+        for index in sorted(by_new_index):
+            parts = [
+                f"new_memory_index: {index}",
+                f"new_memory_text: {candidates[index].text}",
+                "proposed_existing_connections:",
+            ]
+            seen_pairs: set[tuple[str, str]] = set()
+            for connection in by_new_index[index]:
+                mem_id = connection["existing_mem_id"]
+                relation = connection["relation"]
+                pair = (mem_id, relation)
+                if pair in seen_pairs:
+                    continue
+                seen_pairs.add(pair)
+                item = self.store.get(mem_id)
+                if item is None:
+                    continue
+                parts.extend(
+                    [
+                        f"- existing_mem_id: {item.mem_id}",
+                        f"  relation: {relation}",
+                        f"  {self._format_links(item.mem_id)}",
+                    ]
+                )
+                if item.mem_id in emitted_existing_text:
+                    parts.append(f"  existing_text: see {item.mem_id} above")
+                else:
+                    parts.append(f"  existing_text: {item.text}")
+                    emitted_existing_text.add(item.mem_id)
+            if len(parts) > 3:
+                sections.append("\n".join(parts))
         return "\n\n".join(sections) if sections else "none"
 
     def _chunks(self, values: list[str], size: int) -> list[list[str]]:
