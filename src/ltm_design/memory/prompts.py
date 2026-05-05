@@ -173,7 +173,18 @@ You receive:
 - new candidate memories
 - proposed connections for existing memories
 
-Determine which proposed connections are significant and organize extracts of existing memories relevant to said connection into a concise paragraph of connections for each new memory, citing memory ids and the connection to the new memory inline, for example (id: {mem_id}, contradicts). If a memory adds no nuance to existing memories ensure it is output with the same_as relation. Do not invent connections outside of the ones proposed to you. Drop weak, vague, or duplicate proposed connections. To drop something is to ignore and exclude any mention of it in your output.
+Determine which proposed connections are significant. For each new memory with significant connections, write a concise paragraph that explains how the connected existing memories relate to that new memory.
+
+Each cited connection must include:
+- the relation to the new memory
+- the specific relevant part of the existing memory, quoted or tightly paraphrased
+- the existing memory id and relation inline, e.g. (id: {mem_id}, contradicts)
+
+Example output style:
+0:
+This contradicts the user's previous claim that they are "living in NY rn" (id: mem_y, contradicts), supports their claim that they "move around frequently to find a job" (id: mem_z, supports), and was likely caused by their previous complaint about "why tf are housing prices in NY so high" (id: mem_aa, caused_by).
+
+If a new memory adds no nuance to existing memories, include it with the same_as relation and cite the specific existing memory text that makes it redundant. Do not invent connections outside of the ones proposed to you. Drop weak, vague, or duplicate proposed connections. To drop something is to ignore and exclude any mention of it in your output.
 
 Preserve the proposed relation labels unless a fragment clearly mislabeled a direct relationship.
 
@@ -198,9 +209,11 @@ CONNECTION_FRAGMENT_PROMPT = STORAGE_CONNECTION_FRAGMENT_PROMPT
 MAIN_MEMORY_DECISION_PROMPT = """\
 You are continuing the memory cataloging task.
 
-You previously cataloged possible memories. Now you receive summaries of the connections between these new memories and existing ones.
+You previously cataloged possible memories. Now you receive summaries of their connections to existing memories.
 
-Decide which links are valuable enough to create. Only approve links that will help future recall, contradiction handling, deduplication, or memory repair. Do not approve vague relatedness.
+Your new job is to reject new memories that connection search reveals are redundant or otherwise not worth writing, and to approve links that are valuable enough to create. Do not rewrite or re-approve the cataloged memory text.
+
+Only approve links that will help future recall, contradiction handling, deduplication, or memory repair. Do not approve vague relatedness.
 
 Decision rules:
 - if a new memory has a `same_as` connection to an existing memory and/or you have verified that it is redundant, meaning it adds no nuance to existing memories, reject the new memory and do not write it; `same_as` is a deletion/deduplication decision for the new memory and does not need to be included in approved links
@@ -211,11 +224,6 @@ Decision rules:
 
 Output JSON:
 {
-  "approve_memories": [
-    {
-      "new_memory_index": 0
-    }
-  ],
   "reject_memories": [
     {
       "new_memory_index": 0,
@@ -226,8 +234,7 @@ Output JSON:
     {
       "from_new_memory_index": 0,
       "to_mem_id": "string",
-      "relation": "updates|contradicts|supports|elaborates|caused_by|part_of",
-      "reason": "string"
+      "relation": "updates|contradicts|supports|elaborates|caused_by|part_of"
     }
   ]
 }

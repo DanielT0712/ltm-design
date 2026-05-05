@@ -89,11 +89,10 @@ class MemoryOrchestrator:
             if item.get("new_memory_index", -1) < len(candidate_ids)
         }
 
-        for item in decision_raw.get("approve_memories", []):
-            index = item.get("new_memory_index", -1)
-            if index < 0 or index >= len(candidate_ids) or index in rejected_indices:
+        for index, candidate_id in enumerate(candidate_ids):
+            if index in rejected_indices:
                 continue
-            approved = self.store.approve_candidate(candidate_ids[index])
+            approved = self.store.approve_candidate(candidate_id)
             approved_by_index[index] = approved.mem_id
         for index, candidate_id in enumerate(candidate_ids):
             if index in rejected_indices:
@@ -253,14 +252,7 @@ class MemoryOrchestrator:
         return text.strip()
 
     def _decide_memories(self, *, catalog: dict, connections: str) -> dict:
-        payload = "\n\n".join(
-            [
-                "CATALOG",
-                json.dumps(catalog, indent=2),
-                "STORAGE CONNECTION SUMMARY",
-                connections or "No storage-time connections were found.",
-            ]
-        )
+        payload = connections or "No storage-time connections were found."
         text = self.chat_client.chat(
             model=self.models.main,
             messages=[
