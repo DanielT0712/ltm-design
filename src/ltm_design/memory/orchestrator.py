@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Protocol
 
 from ltm_design.llm.client import ChatMessage, parse_json_object
 from ltm_design.memory.embeddings import EmbeddingProvider
 from ltm_design.memory.models import EvidenceRef, Facets, MemoryCandidate, MemoryLink, MemoryRelation
+from ltm_design.memory.models import FragmentKind
 from ltm_design.memory.prompts import (
-    CONNECTION_FRAGMENT_PROMPT,
     MAIN_MEMORY_DECISION_PROMPT,
     MEMORY_CATALOGER_PROMPT,
     MEMORY_FRAGMENT_AGENT_PROMPT,
     MEMORY_SUMMARIZER_PROMPT,
+    STORAGE_CONNECTION_FRAGMENT_PROMPT,
+    STORAGE_CONNECTION_SUMMARIZER_PROMPT,
 )
 from ltm_design.memory.search import MemoryIndexer, MemorySearch
 from ltm_design.memory.store import MemoryStore
@@ -33,7 +36,7 @@ class MemoryModels:
 class MemorySkillResult:
     approved_mem_ids: tuple[str, ...]
     raw_catalog: dict
-    raw_connections: list[dict]
+    raw_connections: str
     raw_decision: dict
 
 
@@ -77,10 +80,7 @@ class MemoryOrchestrator:
             self.store.propose_candidate(candidate, trigger="active_model")
             for candidate in candidates
         ]
-        connections = [
-            self._discover_connections(index, candidate)
-            for index, candidate in enumerate(candidates)
-        ]
+        connections = self._discover_connections(candidates)
         decision_raw = self._decide_memories(catalog=catalog, connections=connections)
         approved_by_index: dict[int, str] = {}
         rejected_indices = {
@@ -168,29 +168,104 @@ class MemoryOrchestrator:
         )
         return parse_json_object(text)
 
-    def _discover_connections(self, index: int, candidate: MemoryCandidate) -> dict:
-        nearby = self.search.search(text=candidate.text, facets=candidate.facets, vector_top_k=12, fts_top_k=12, facet_top_k=12).candidates
-        existing = [self._memory_snippet(candidate.mem_id) for candidate in nearby]
-        payload = {
-            "new_memories": [{"index": index, "text": candidate.text, "facets": candidate.facets.to_dict()}],
-            "existing_memories": existing,
+    def _discover_connections(self, candidates: list[MemoryCandidate]) -> str:
+        if not candidates:
+            return ""
+        max_fragments = 24
+        hit_mem_ids: dict[str, None] = {}
+        for candidate in candidates:
+            nearby = self.search.search(
+                text=candidate.text,
+                facets=candidate.facets,
+                vector_top_k=12,
+                fts_top_k=12,
+                facet_top_k=12,
+            ).candidates
+            for nearby_candidate in nearby:
+                hit_mem_ids[nearby_candidate.mem_id] = None
+
+        fragments = self.store.fragments_containing_mem_ids(
+            hit_mem_ids.keys(),
+            kind=FragmentKind.RECALL,
+            limit=max_fragments,
+        )
+        new_memories_text = self._format_new_memories(candidates)
+        if not fragments:
+            return ""
+
+        fragment_outputs: list[dict] = []
+        for fragment in fragments:
+            prompt_text = "\n\n".join(
+                [
+                    "NEW MEMORIES",
+                    new_memories_text,
+                    f"EXISTING MEMORIES ({fragment.fragment_id})",
+                    self._format_existing_memories(fragment.mem_ids),
+                ]
+            )
+            text = self.chat_client.chat(
+                model=self.models.worker,
+                messages=[
+                    ChatMessage(role="system", content=STORAGE_CONNECTION_FRAGMENT_PROMPT),
+                    ChatMessage(role="user", content=prompt_text),
+                ],
+            )
+            output = parse_json_object(text)
+            output["fragment_id"] = fragment.fragment_id
+            fragment_outputs.append(output)
+
+        connected_ids = {
+            connection["existing_mem_id"]
+            for output in fragment_outputs
+            for connection in output.get("connections", [])
+            if connection.get("existing_mem_id")
         }
+        return self._summarize_storage_connections(
+            new_memories_text=new_memories_text,
+            fragment_outputs=fragment_outputs,
+            connected_ids=connected_ids,
+        )
+
+    def _summarize_storage_connections(
+        self,
+        *,
+        new_memories_text: str,
+        fragment_outputs: list[dict],
+        connected_ids: set[str],
+    ) -> str:
+        if not connected_ids:
+            return ""
+        prompt_text = "\n\n".join(
+            [
+                "NEW MEMORIES",
+                new_memories_text,
+                "PROPOSED CONNECTIONS",
+                self._format_proposed_connection_memories(fragment_outputs, connected_ids),
+            ]
+        )
         text = self.chat_client.chat(
             model=self.models.worker,
             messages=[
-                ChatMessage(role="system", content=CONNECTION_FRAGMENT_PROMPT),
-                ChatMessage(role="user", content=json.dumps(payload, indent=2)),
+                ChatMessage(role="system", content=STORAGE_CONNECTION_SUMMARIZER_PROMPT),
+                ChatMessage(role="user", content=prompt_text),
             ],
         )
-        return parse_json_object(text)
+        return text.strip()
 
-    def _decide_memories(self, *, catalog: dict, connections: list[dict]) -> dict:
-        payload = {"catalog": catalog, "connections": connections}
+    def _decide_memories(self, *, catalog: dict, connections: str) -> dict:
+        payload = "\n\n".join(
+            [
+                "CATALOG",
+                json.dumps(catalog, indent=2),
+                "STORAGE CONNECTION SUMMARY",
+                connections or "No storage-time connections were found.",
+            ]
+        )
         text = self.chat_client.chat(
             model=self.models.main,
             messages=[
                 ChatMessage(role="system", content=MAIN_MEMORY_DECISION_PROMPT),
-                ChatMessage(role="user", content=json.dumps(payload, indent=2)),
+                ChatMessage(role="user", content=payload),
             ],
         )
         return parse_json_object(text)
@@ -263,6 +338,92 @@ class MemoryOrchestrator:
             "reference_count": item.reference_count,
             "links": [link.to_dict() for link in self.store.links_for(item.mem_id)],
         }
+
+    def _format_new_memories(self, candidates: list[MemoryCandidate]) -> str:
+        sections: list[str] = []
+        for index, candidate in enumerate(candidates):
+            sections.append(
+                "\n".join(
+                    [
+                        f"new_memory_index: {index}",
+                        f"text: {candidate.text}",
+                        f"facets: {self._format_facets(candidate.facets)}",
+                    ]
+                )
+            )
+        return "\n\n".join(sections)
+
+    def _format_existing_memories(self, mem_ids: Iterable[str]) -> str:
+        sections: list[str] = []
+        for mem_id in mem_ids:
+            item = self.store.get(mem_id)
+            if item is None:
+                continue
+            sections.append(
+                "\n".join(
+                    part
+                    for part in [
+                        f"mem_id: {item.mem_id}",
+                        f"text: {item.text}",
+                        f"facets: {self._format_facets(item.facets)}",
+                        self._format_links(item.mem_id),
+                    ]
+                    if part.strip()
+                )
+            )
+        return "\n\n".join(sections)
+
+    def _format_facets(self, facets: Facets) -> str:
+        parts = [
+            f"{key}: {', '.join(values)}"
+            for key, values in facets.to_dict().items()
+            if values
+        ]
+        return "; ".join(parts) if parts else "none"
+
+    def _format_links(self, mem_id: str) -> str:
+        links = self.store.links_for(mem_id)
+        if not links:
+            return "links: none"
+        return "links: " + ", ".join(
+            f"{link.relation.value} {link.to_mem_id}" for link in links
+        )
+
+    def _format_proposed_connection_memories(
+        self,
+        fragment_outputs: list[dict],
+        connected_ids: set[str],
+    ) -> str:
+        connections_by_mem_id: dict[str, list[dict]] = {mem_id: [] for mem_id in sorted(connected_ids)}
+        for output in fragment_outputs:
+            for connection in output.get("connections", []):
+                mem_id = connection.get("existing_mem_id")
+                if mem_id in connections_by_mem_id:
+                    connections_by_mem_id[mem_id].append(connection)
+
+        sections: list[str] = []
+        for mem_id, connections in connections_by_mem_id.items():
+            item = self.store.get(mem_id)
+            if item is None:
+                continue
+            proposed_connections = ", ".join(
+                f"new_memory_index {connection.get('new_memory_index')}: {connection.get('relation')}"
+                for connection in connections
+            )
+            sections.append(
+                "\n".join(
+                    part
+                    for part in [
+                        f"mem_id: {item.mem_id}",
+                        f"proposed_connections: {proposed_connections or 'none'}",
+                        f"text: {item.text}",
+                        f"facets: {self._format_facets(item.facets)}",
+                        self._format_links(item.mem_id),
+                    ]
+                    if part.strip()
+                )
+            )
+        return "\n\n".join(sections) if sections else "none"
 
     def _chunks(self, values: list[str], size: int) -> list[list[str]]:
         return [values[index:index + size] for index in range(0, len(values), size)]

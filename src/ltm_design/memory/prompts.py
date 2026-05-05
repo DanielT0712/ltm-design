@@ -131,14 +131,14 @@ Output JSON:
 MEMORY_EXTRACTION_BRANCH_PROMPT = MEMORY_CATALOGER_PROMPT
 
 
-CONNECTION_FRAGMENT_PROMPT = """\
-You are checking whether newly cataloged memories directly connect to existing memories.
+STORAGE_CONNECTION_FRAGMENT_PROMPT = """\
+You are a memory connection checker.
 
 You receive:
-- a group of new potential memory items
+- a group of new potential memory candidates
 - a group of existing memory items
 
-Your job is to identify direct relationships between the new memories and the existing memories. It is fine to return no connections.
+Your job is to identify direct relationships between each new memory and the existing memory items. It is fine to return no connections.
 
 Allowed relations:
 - updates: the new memory changes or supersedes the old one
@@ -150,6 +150,8 @@ Allowed relations:
 - same_as: likely duplicate or merge candidate
 
 Only connect memories that are directly related. Do not connect memories merely because they share a broad topic, facet, person, or vibe.
+Return at most one relation for a given `(new_memory_index, existing_mem_id)` pair. Pick the strongest relation.
+Prefer sparse, high-confidence relationships over dense weak relationships.
 
 Output JSON:
 {
@@ -164,36 +166,54 @@ Output JSON:
 """
 
 
+STORAGE_CONNECTION_SUMMARIZER_PROMPT = """\
+You are a memory connection summarizer.
+
+You receive:
+- new candidate memories
+- proposed connections for existing memories
+
+Determine which proposed connections are significant and organize extracts of existing memories relevant to said connection into a concise paragraph of connections for each new memory, citing memory ids and the connection to the new memory inline, for example (id: {mem_id}, contradicts). If a memory adds no nuance to existing memories ensure it is output with the same_as relation. Do not invent connections outside of the ones proposed to you. Drop weak, vague, or duplicate proposed connections. To drop something is to ignore and exclude any mention of it in your output.
+
+Preserve the proposed relation labels unless a fragment clearly mislabeled a direct relationship.
+
+Allowed relations:
+- updates: the new memory changes or supersedes the old one
+- contradicts: both memories cannot be true together
+- supports: separate evidence strengthens the same claim
+- elaborates: one memory adds useful detail to another
+- caused_by: one memory is a cause or precipitating reason for another
+- part_of: one memory is a component of a larger event/preference/pattern
+- same_as: likely duplicate or merge candidate
+
+Output plain text, with each paragraph for a new memory preceded by that memory's index.
+"""
+
+
+# Backwards-compatible alias for older tests/imports. Storage code should use the
+# storage-specific prompt names above.
+CONNECTION_FRAGMENT_PROMPT = STORAGE_CONNECTION_FRAGMENT_PROMPT
+
+
 MAIN_MEMORY_DECISION_PROMPT = """\
 You are continuing the memory cataloging task.
 
-You previously cataloged possible memories. Now you receive connection and redundancy information for those memories.
+You previously cataloged possible memories. Now you receive summaries of the connections between these new memories and existing ones.
 
-Decide:
-- which memories should be stored
-- which memories are redundant or too low-signal
-- which fixed-relation links are valuable enough to create
-
-Approve all durable, user/context-specific memories worth preserving. Do not force the conversation into one main memory. Reject generic world knowledge, filler, unsupported inference, and duplicates without useful new evidence.
-
-Only approve links that will help future recall, contradiction handling, deduplication, or memory repair. Do not approve vague relatedness.
+Decide which links are valuable enough to create. Only approve links that will help future recall, contradiction handling, deduplication, or memory repair. Do not approve vague relatedness.
 
 Decision rules:
-- approve memory writes generously when they are durable and user/context-specific
-- reject memories that are redundant with an existing memory unless they add evidence or warrant a `supports`, `updates`, `contradicts`, or `elaborates` link
-- if a new memory has a `same_as` connection to an existing memory, reject the new memory and do not write it; `same_as` is a deletion/deduplication decision for the new memory and does not need to be included in approved links
+- if a new memory has a `same_as` connection to an existing memory and/or you have verified that it is redundant, meaning it adds no nuance to existing memories, reject the new memory and do not write it; `same_as` is a deletion/deduplication decision for the new memory and does not need to be included in approved links
 - approve `updates` or `contradicts` links when future answers need to know that the memory state changed or conflicts
 - approve `supports` only for meaningfully independent evidence
-- preserve evidence refs; do not approve memories with no source evidence
-- if approving a memory with edited wording, preserve the user's meaning and do not make it more certain than the evidence
+- when writing approved links ensure you use the inline mem_ids that are cited in the summaries
 - approve no more links than needed; a sparse useful graph is better than a dense vague graph
 
 Output JSON:
 {
   "approve_memories": [
     {
-      "new_memory_index": 0,
-      "approved_text": "string|null"
+      "new_memory_index": 0
     }
   ],
   "reject_memories": [

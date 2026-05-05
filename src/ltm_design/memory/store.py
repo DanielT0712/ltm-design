@@ -502,6 +502,27 @@ class MemoryStore:
             now=now,
         )
 
+    def list_fragments(self, *, kind: FragmentKind | None = None) -> list[MemoryFragment]:
+        return self._list_fragments(kind=kind)
+
+    def fragments_containing_mem_ids(
+        self,
+        mem_ids: Iterable[str],
+        *,
+        kind: FragmentKind | None = None,
+        limit: int | None = None,
+    ) -> list[MemoryFragment]:
+        wanted = set(mem_ids)
+        if not wanted:
+            return []
+        fragments: list[MemoryFragment] = []
+        for fragment in self._list_fragments(kind=kind):
+            if wanted.intersection(fragment.mem_ids):
+                fragments.append(fragment)
+                if limit is not None and len(fragments) >= limit:
+                    break
+        return fragments
+
     def _upsert_fts(self, mem_id: str, title: str, lexical_text: str, facets: Facets) -> None:
         self._conn.execute("DELETE FROM memory_items_fts WHERE mem_id = ?", (mem_id,))
         self._conn.execute(

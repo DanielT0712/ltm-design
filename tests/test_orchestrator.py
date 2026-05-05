@@ -1,4 +1,5 @@
 import json
+import re
 
 from ltm_design.llm.client import ChatMessage
 from ltm_design.memory.models import MemoryCandidate
@@ -28,8 +29,14 @@ class FakeChatClient:
                     "processed_through": "[src:thread_1 msg:u_1]",
                 }
             )
-        if "directly connect" in system:
-            return json.dumps({"connections": [{"new_memory_index": 0, "existing_mem_id": "mem_existing", "relation": "same_as"}]})
+        if "memory connection checker" in system:
+            existing_mem_id = re.search(r"^mem_id: (mem_[^\n]+)", messages[1].content, re.MULTILINE).group(1)
+            return json.dumps({"connections": [{"new_memory_index": 0, "existing_mem_id": existing_mem_id, "relation": "same_as"}]})
+        if "memory connection summarizer" in system:
+            existing_mem_id = re.search(r"^mem_id: (mem_[^\n]+)", messages[1].content, re.MULTILINE).group(1)
+            assert "CONNECTED EXISTING MEMORIES" not in messages[1].content
+            assert "proposed_connections: new_memory_index 0: same_as" in messages[1].content
+            return f"0: likely duplicate of (id: {existing_mem_id}, same_as)."
         if "continuing the memory cataloging task" in system:
             return json.dumps(
                 {
@@ -58,6 +65,8 @@ def test_orchestrator_uses_pro_for_main_and_flash_for_workers(tmp_path):
         chat_client=fake,
         models=MemoryModels(main="deepseek-v4-pro", worker="deepseek-v4-flash"),
     )
+    orchestrator.indexer.index_item(existing)
+    store.assign_to_recall_fragment(existing.mem_id)
 
     result = orchestrator.process_memory_skill(
         processed_through="[src:thread_1 msg:u_0]",
@@ -68,8 +77,20 @@ def test_orchestrator_uses_pro_for_main_and_flash_for_workers(tmp_path):
     assert [call[0] for call in fake.calls] == [
         "deepseek-v4-pro",
         "deepseek-v4-flash",
+        "deepseek-v4-flash",
         "deepseek-v4-pro",
     ]
+    fragment_input = fake.calls[1][1][1].content
+    assert "NEW MEMORIES" in fragment_input
+    assert "new_memory_index: 0" in fragment_input
+    assert "existing_fragment" not in fragment_input
+    assert "\"new_memories\"" not in fragment_input
+    summary_input = fake.calls[2][1][1].content
+    assert "PROPOSED CONNECTIONS" in summary_input
+    assert "\"fragment_outputs\"" not in summary_input
+    decision_input = fake.calls[3][1][1].content
+    assert "STORAGE CONNECTION SUMMARY" in decision_input
+    assert "likely duplicate of" in decision_input
 
 
 def test_orchestrator_retrieves_and_summarizes_with_worker_model(tmp_path):
